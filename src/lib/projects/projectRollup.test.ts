@@ -45,32 +45,39 @@ describe('projectRollup — Filter agents by project', () => {
     row('d', null, 'working') // unassigned
   ];
 
-  it('counts agents per project and flags attention + working', () => {
+  it('counts agents per project and breaks down waiting + working', () => {
     const counts = projectCounts(rows, projects);
-    expect(counts.map((c) => [c.project.id, c.count, c.attn, c.working])).toEqual([
-      ['pay', 2, true, true], // b is waiting -> attention; a is working
-      ['web', 1, false, false] // c finished -> neither attention nor working
+    expect(counts.map((c) => [c.project.id, c.count, c.waiting, c.working])).toEqual([
+      ['pay', 2, 1, 1], // b waiting -> waiting:1; a working -> working:1
+      ['web', 1, 0, 0] // c finished -> neither
     ]);
     expect(unassignedCount(rows)).toBe(1);
   });
 
-  it('Project flags a working agent', () => {
-    const ps = [proj('a'), proj('b')];
+  it('counts multiple waiting and working agents independently', () => {
+    const ps = [proj('a')];
     const rs = [
-      row('w', 'a', 'working'), // working, none waiting -> blue dot
-      row('q', 'b', 'finished') // nothing live -> no dot
+      row('w1', 'a', 'waiting'),
+      row('w2', 'a', 'error'), // errored also counts as waiting-on-you
+      row('k1', 'a', 'working'),
+      row('k2', 'a', 'working'),
+      row('k3', 'a', 'working'),
+      row('i', 'a', 'idle') // neither waiting nor working
     ];
-    const counts = projectCounts(rs, ps);
-    expect(counts.map((c) => [c.project.id, c.attn, c.working])).toEqual([
-      ['a', false, true], // working only -> blue dot
-      ['b', false, false] // finished -> no dot
-    ]);
-    // A paused/archived working agent does NOT advertise as working.
-    expect(projectCounts([{ ...row('z', 'a', 'working'), paused: true }], ps)
-      .find((c) => c.project.id === 'a')?.working).toBe(false);
+    const c = projectCounts(rs, ps)[0];
+    expect([c.count, c.waiting, c.working]).toEqual([6, 2, 3]);
   });
 
-  it('Attention outranks working', () => {
+  it('a paused/archived working agent is not counted as working', () => {
+    const ps = [proj('a')];
+    expect(
+      projectCounts([{ ...row('z', 'a', 'working'), paused: true }], ps).find(
+        (c) => c.project.id === 'a'
+      )?.working
+    ).toBe(0);
+  });
+
+  it('waiting and working are counted independently (both non-zero together)', () => {
     const ps = [proj('c')];
     const counts = projectCounts(
       [
@@ -79,9 +86,9 @@ describe('projectRollup — Filter agents by project', () => {
       ],
       ps
     );
-    // Both flags raised; the panel renders the red (attention) dot, blue only as fallback.
-    expect(counts[0].attn).toBe(true);
-    expect(counts[0].working).toBe(true);
+    // Both counts raised; the panel shows the amber AND the blue count side by side.
+    expect(counts[0].waiting).toBe(1);
+    expect(counts[0].working).toBe(1);
   });
 
   it('Filter agents by project', () => {

@@ -15,6 +15,7 @@
   import { voice } from '$lib/settings/voice.svelte';
   import { autoAdvance } from '$lib/settings/autoAdvance.svelte';
   import { compactMode } from '$lib/settings/compactMode.svelte';
+  import { projectAgentCounts } from '$lib/settings/projectAgentCounts.svelte';
   import { shellSettings } from '$lib/settings/shell.svelte';
   import { subagentsVisible } from '$lib/settings/subagentsVisible.svelte';
   import { uiPrefs } from '$lib/settings/uiPrefs.svelte';
@@ -123,6 +124,8 @@
     void autoAdvance.load();
     // Load the compact-mode preference (opt-in; defaults OFF / full three-line rows).
     void compactMode.load();
+    // Load the project waiting/working breakdown preference (defaults ON).
+    void projectAgentCounts.load();
     // Resolve the platform default shell from the backend and load the user's
     // shell preference. The layout restore below AWAITS this: until it resolves,
     // `defaultShell()` still reports the Unix default, and restoring a Windows

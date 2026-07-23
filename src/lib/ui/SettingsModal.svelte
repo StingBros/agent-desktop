@@ -20,6 +20,7 @@
   import { voice } from '$lib/settings/voice.svelte';
   import { autoAdvance } from '$lib/settings/autoAdvance.svelte';
   import { compactMode } from '$lib/settings/compactMode.svelte';
+  import { projectAgentCounts } from '$lib/settings/projectAgentCounts.svelte';
   import { shellSettings } from '$lib/settings/shell.svelte';
   import { subagentsVisible } from '$lib/settings/subagentsVisible.svelte';
   import { notifications, type AlertMode } from '$lib/settings/notifications.svelte';
@@ -486,6 +487,22 @@
                   Check for updates
                 </button>
               {/if}
+            </div>
+          </li>
+        </ul>
+      </section>
+
+      <section class="group">
+        <span class="label">Features</span>
+        <ul class="rows">
+          <li class="row">
+            <span class="desc">Show waiting vs working agent counts on projects</span>
+            <div class="control">
+              <input
+                type="checkbox"
+                checked={projectAgentCounts.prefs.enabled}
+                onchange={(e) => projectAgentCounts.setEnabled(e.currentTarget.checked)}
+              />
             </div>
           </li>
         </ul>

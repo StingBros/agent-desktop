@@ -31,20 +31,24 @@ export interface ProjectCount {
   project: Project;
   /** Number of agents currently assigned to this project. */
   count: number;
-  /** Whether any of this project's agents is waiting on you / errored. */
-  attn: boolean;
   /**
-   * Whether any of this project's agents is actively working (status `working`).
-   * Raised independently of `attn`; the panel renders the attention (red) dot
-   * when `attn` is set and only falls back to the working (blue) dot otherwise.
+   * How many of this project's agents are WAITING on you (waiting / errored —
+   * `needsAttention`). The panel shows this as the amber count; zero hides it.
    */
-  working: boolean;
+  waiting: number;
+  /**
+   * How many of this project's agents are actively WORKING (status `working`).
+   * Independent of `waiting` (the two statuses are mutually exclusive); the panel
+   * shows this as the blue count alongside the amber one. Zero hides it.
+   */
+  working: number;
 }
 
 /**
- * Per-project counts + attention flags, in the given project order. Agents whose
- * `projectId` doesn't match any known project are ignored here (they surface via
- * the UNASSIGNED bucket / count instead).
+ * Per-project counts, in the given project order: the total live agents plus the
+ * WAITING (needs-you) and WORKING breakdown the panel renders as two colored
+ * counts. Agents whose `projectId` doesn't match any known project are ignored
+ * here (they surface via the UNASSIGNED bucket / count instead).
  */
 export function projectCounts(
   rows: ReadonlyArray<AgentRow>,
@@ -55,8 +59,8 @@ export function projectCounts(
     return {
       project,
       count: mine.length,
-      attn: mine.some(needsAttention),
-      working: mine.some(isWorking)
+      waiting: mine.filter(needsAttention).length,
+      working: mine.filter(isWorking).length
     };
   });
 }
