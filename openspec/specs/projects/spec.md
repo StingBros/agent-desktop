@@ -19,8 +19,10 @@ footer is showing — the **ahead** (↑) indicator becomes a Push button and th
 **behind** (↓) indicator a Pull button. Both surfaces invoke the SAME action
 against the project's FOLDER (independent of any running agent session), shelling
 out to `git push` / `git pull --ff-only` in that folder, run NON-INTERACTIVELY
-(no credential / passphrase / host-key prompt) so a sync that would otherwise
-prompt fails fast instead of hanging. Pull is fast-forward only, so a divergent
+(no terminal credential prompt, no GUI credential-helper window — e.g. Windows'
+Git Credential Manager — and no ssh passphrase / host-key prompt; cached
+credentials still resolve silently) so a sync that would otherwise prompt fails
+fast instead of hanging or popping an auth window. Pull is fast-forward only, so a divergent
 branch fails cleanly without ever leaving the worktree mid-merge.
 
 A Push of a branch that already tracks an upstream runs `git push`. A Push of an
@@ -259,12 +261,24 @@ and project pane's "commits to pull" (↓ behind) count reflects new remote comm
 WITHOUT any manual fetch. The background fetch SHALL run always-on on a SLOW clock
 (on the order of a few minutes), plus an initial fetch shortly after launch, and
 SHALL be SEPARATE from the fast local status poll. It SHALL cover all tracked
-project folders in parallel, run NON-INTERACTIVELY (so an offline or
-credential-less folder fails fast rather than hanging), and be READ-ONLY — it
+project folders in parallel, run NON-INTERACTIVELY — suppressing not only git's
+terminal prompt but any GUI credential helper (e.g. Windows' Git Credential
+Manager) and ssh prompts, so an offline or credential-less folder fails fast
+rather than hanging OR popping an auth window on every poll (cached credentials
+still resolve silently) — and be READ-ONLY — it
 updates only remote-tracking refs (and, under a non-default fetch refspec, at most
 other non-checked-out branch refs) and never modifies the worktree. The fast local
 status probe SHALL remain unchanged (it computes ahead/behind from local refs and
 does not itself fetch); it reads the freshly-advanced refs on its next poll.
+
+Because the fetch is silent, a fetch FAILURE would otherwise leave the ahead/behind
+count quietly stale with no signal. So the background fetch SHALL report each
+folder's outcome (no-remote / fetched / failed), and when a folder that HAS a
+remote FAILS to fetch (offline / missing credentials), the git indicator for that
+project SHALL show a subtle, non-modal warning (a ⚠ pill with an explanatory
+tooltip) — NOT a popup, toast, or repeated alert. A folder with no remote (nothing
+to fetch) SHALL show no such indicator, and the indicator SHALL clear itself once a
+later background fetch for that folder succeeds.
 
 #### Scenario: New remote commit becomes visible without a manual fetch
 
@@ -279,7 +293,18 @@ does not itself fetch); it reads the freshly-advanced refs on its next poll.
 - **WHEN** the background fetch runs over the tracked project folders
 - **THEN** it fetches them in parallel, and a folder that cannot fetch (no remote,
   offline, or missing credentials) fails fast and is skipped without blocking the
-  other folders or surfacing an error to the user.
+  other folders, surfacing an error to the user, or popping an interactive
+  credential-helper (e.g. Git Credential Manager) auth window.
+
+#### Scenario: A failed background fetch is surfaced without spamming
+
+- **WHEN** the background fetch for a project that HAS a remote fails (offline or
+  missing credentials) while another tracked project with no remote is simply
+  skipped
+- **THEN** the failing project's git indicator shows a subtle ⚠ warning pill with a
+  tooltip explaining the count may be stale and how to fix it, the no-remote project
+  shows no such indicator, and neither produces a popup, toast, or repeated alert;
+  the ⚠ clears on the next successful background fetch for that project.
 
 #### Scenario: Fetch never alters the working tree
 

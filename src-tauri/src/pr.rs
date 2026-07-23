@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::no_window::NoConsoleWindow;
+
 /// Hard timeout for the `gh pr list` call so a hung CLI (e.g. a wedged network
 /// auth refresh) can never block the PR-status refresh; on timeout the runner
 /// degrades to [`PrStatus::Unknown`].
@@ -393,6 +395,7 @@ pub async fn pr_status_for(repo_path: &str, base: &str) -> PrStatus {
 
     let args = gh_pr_list_args(&branch, base);
     let mut cmd = tokio::process::Command::new("gh");
+    cmd.no_console_window();
     cmd.args(&args)
         .current_dir(repo_path)
         .stdin(Stdio::null())
@@ -464,6 +467,7 @@ pub async fn open_prs_for(repo_path: &str, base: &str) -> OpenPrs {
 async fn open_pr_list_for(repo_path: &str, base: &str) -> Option<Vec<OpenPr>> {
     let args = gh_open_prs_args(base);
     let mut cmd = tokio::process::Command::new("gh");
+    cmd.no_console_window();
     cmd.args(&args)
         .current_dir(repo_path)
         .stdin(Stdio::null())
@@ -498,6 +502,7 @@ async fn open_pr_list_for(repo_path: &str, base: &str) -> Option<Vec<OpenPr>> {
 /// per-commit diff links.
 pub async fn repo_url_for(repo_path: &str) -> Option<String> {
     let mut cmd = tokio::process::Command::new("gh");
+    cmd.no_console_window();
     cmd.args(["repo", "view", "--json", "url"])
         .current_dir(repo_path)
         .stdin(Stdio::null())
@@ -531,6 +536,7 @@ async fn pulls_url_for(repo_path: &str) -> Option<String> {
 /// caller treats as "no branch".
 async fn current_branch(dir: &str) -> Option<String> {
     let output = tokio::process::Command::new("git")
+        .no_console_window()
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])

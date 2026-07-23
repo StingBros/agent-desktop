@@ -4,6 +4,7 @@ pub mod events;
 pub mod git;
 pub mod ipc;
 pub mod models;
+pub mod no_window;
 pub mod notify_click;
 pub mod orchestration;
 pub mod polish;
@@ -1228,12 +1229,16 @@ fn git_pull(repo_path: String) -> Result<String, String> {
 /// local-only), this performs network I/O, so the frontend drives it on a SLOW
 /// background clock; the next `git_status_for` poll then reports an accurate
 /// ahead/behind count without any manual `git fetch`. Read-only and
-/// non-interactive — a folder with no remote / offline / no creds is a silent
-/// no-op — so this never fails the caller.
+/// non-interactive — a folder with no remote / offline / no creds never prompts
+/// or pops an auth window — so this never fails the caller.
+///
+/// Returns each path's [`git::FetchStatus`] (`skipped` / `ok` / `failed`) so the
+/// frontend can flag a folder that HAS a remote but couldn't fetch (offline /
+/// missing credentials) with a subtle indicator, instead of the count just going
+/// silently stale.
 #[tauri::command(async)]
-fn git_fetch_for(paths: Vec<String>) -> Result<(), String> {
-    git::fetch_remotes(&paths);
-    Ok(())
+fn git_fetch_for(paths: Vec<String>) -> std::collections::HashMap<String, git::FetchStatus> {
+    git::fetch_remotes(&paths)
 }
 
 /// List the local and remote-tracking branches for `repo_path`, plus the name

@@ -95,7 +95,8 @@
     openPrsResult = null,
     onCommit,
     commitProject = null,
-    pushProject = null
+    pushProject = null,
+    fetchFailed = false
   }: {
     git: GitStatus | null;
     always?: boolean;
@@ -129,6 +130,11 @@
      *  `ahead > 0`, listing the commits to push and offering a "Push now" action.
      *  Without it the ahead pill calls `onPush` directly (or is inert). */
     pushProject?: PushProject | null;
+    /** True when the last background fetch for this project FAILED — it has a
+     *  remote but couldn't be fetched (offline / missing credentials). Shows a ⚠
+     *  indicator so a silently-stale ahead/behind (↓) count is visible, with a
+     *  tooltip pointing at how to fix it. */
+    fetchFailed?: boolean;
   } = $props();
 
   // The modified (uncommitted-files) pill is a clickable COMMIT button only when
@@ -468,6 +474,18 @@
           <span class="txt">{openPrs.label}</span>
         </button>
       {/if}
+      {#if fetchFailed}
+        <!-- Background fetch failed for a repo that HAS a remote (offline /
+             missing credentials): the ↓ behind count may be stale. A quiet ⚠
+             indicator (no popup) makes that visible; the tooltip says how to fix
+             it. It clears itself as soon as a later background fetch succeeds. -->
+        <span
+          class="pill fetchfail"
+          use:tooltip={"Couldn’t fetch from the remote — the ↓ count may be stale. Run `git fetch` once in a terminal (e.g. to sign in); it then refreshes automatically."}
+        >
+          <Icon name="triangle-alert" size={12} />
+        </span>
+      {/if}
     </span>
   {:else}
     <span class="pill branch dim" use:tooltip={'No git repository for this pane'}>
@@ -730,6 +748,14 @@
     background: var(--caution-tint);
     color: var(--caution-500);
     box-shadow: none;
+  }
+  /* Background-fetch failure: a caution (amber) indicator, matching the other
+     caution pills. Non-interactive — a passive status hint, not a button. */
+  .fetchfail {
+    background: var(--caution-tint);
+    color: var(--caution-500);
+    box-shadow: none;
+    cursor: default;
   }
   .modified.zero {
     background: var(--space-750);

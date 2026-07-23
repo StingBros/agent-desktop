@@ -64,10 +64,23 @@ export class ProjectGitStore {
   /** The live path -> git-status map. Deep-reactive via the runes proxy. */
   byPath = $state<GitMap>({});
 
+  /** Paths whose most recent background fetch FAILED — the folder HAS a remote but
+   *  couldn't be fetched (offline / missing credentials). Drives the git pill's ⚠
+   *  indicator so a silently-stale ahead/behind count is visible. A path with no
+   *  remote (or a clean fetch) is absent/false — no indicator. */
+  fetchFailed = $state<Record<string, boolean>>({});
+
   /** The git status for a project path, or null when none has arrived yet. */
   forPath(path: string | null | undefined): GitStatus | null {
     if (!path) return null;
     return this.byPath[path] ?? null;
+  }
+
+  /** Whether the last background fetch for a project path failed (has a remote but
+   *  couldn't fetch). False for a null path, a no-remote folder, or a clean fetch. */
+  fetchFailedFor(path: string | null | undefined): boolean {
+    if (!path) return false;
+    return this.fetchFailed[path] ?? false;
   }
 
   /**
@@ -120,10 +133,28 @@ export class ProjectGitStore {
   async fetchRemotes(paths: string[]): Promise<void> {
     if (paths.length === 0) return;
     try {
-      await invoke('git_fetch_for', { paths });
+      const outcomes = await invoke<unknown>('git_fetch_for', { paths });
+      this.applyFetchOutcomes(outcomes);
     } catch (err) {
       console.warn('git_fetch_for failed; remote-tracking refs not refreshed:', err);
     }
+  }
+
+  /**
+   * Replace `fetchFailed` from a `git_fetch_for` outcome map (path -> 'skipped' |
+   * 'ok' | 'failed'). A path is flagged (true) ONLY when its outcome is 'failed'
+   * — a folder with a remote it couldn't reach; 'ok'/'skipped'/anything-else
+   * clears it. Replacing wholesale (the fetch always covers the full current path
+   * set) self-prunes stale entries for removed projects. A non-object payload is
+   * ignored, leaving the previous flags intact.
+   */
+  private applyFetchOutcomes(outcomes: unknown): void {
+    if (!outcomes || typeof outcomes !== 'object') return;
+    const next: Record<string, boolean> = {};
+    for (const [path, status] of Object.entries(outcomes as Record<string, unknown>)) {
+      next[path] = status === 'failed';
+    }
+    this.fetchFailed = next;
   }
 }
 

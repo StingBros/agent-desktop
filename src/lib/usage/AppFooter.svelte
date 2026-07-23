@@ -216,7 +216,7 @@
   <div class="zone left">
     <div class="left-git">
       <div class="branch-anchor" bind:this={branchAnchorEl}>
-        <GitInfo git={folderGit} always {onPush} {onPull} busy={gitSyncing} {onPickBranch} {onPr} {prExists} {prNumber} {prVisible} openPrs={openPrsView_} {openPrsResult} {onCommit} {commitProject} pushProject={pushProjectInfo} />
+        <GitInfo git={folderGit} always {onPush} {onPull} busy={gitSyncing} {onPickBranch} {onPr} {prExists} {prNumber} {prVisible} openPrs={openPrsView_} {openPrsResult} {onCommit} {commitProject} pushProject={pushProjectInfo} fetchFailed={projectGit.fetchFailedFor(gitProject?.path)} />
       </div>
       <BranchPicker
         open={branchOpen}

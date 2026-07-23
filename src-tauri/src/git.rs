@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::no_window::NoConsoleWindow;
+
 use serde::Serialize;
 
 /// The most paths we surface for the uncommitted-files hover list. The UI only
@@ -95,7 +97,13 @@ pub fn parse_porcelain_paths(porcelain: &str) -> Vec<String> {
 /// Run `git -C <dir> <args...>`, returning trimmed stdout on a clean exit, else
 /// `None` (non-zero exit, spawn error, or non-UTF8 output). Fully guarded.
 fn run_git(dir: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+    let output = Command::new("git")
+        .no_console_window()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -107,7 +115,13 @@ fn run_git(dir: &str, args: &[&str]) -> Option<String> {
 /// else `None`. Used for `status --porcelain`, whose first status column can be a
 /// SPACE (` M file`) that a leading trim would eat — corrupting the path parse.
 fn run_git_raw(dir: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+    let output = Command::new("git")
+        .no_console_window()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -210,26 +224,51 @@ pub fn status_for_paths(paths: &[String]) -> HashMap<String, GitStatus> {
 // own message on BOTH success and failure (a push/pull is an explicit action the
 // user wants feedback on), so the frontend can show it in a toast.
 
+/// Make a network git `Command` fully NON-INTERACTIVE — suppressing not just
+/// git's built-in TERMINAL prompt but also any GUI credential helper (notably
+/// Windows' Git Credential Manager, `credential.helper=manager`) and an ssh
+/// passphrase / host-key prompt. Cached credentials still resolve silently; only
+/// the interactive UI is disabled, so an authenticated remote keeps working while
+/// an unauthenticated one fails fast.
+///
+/// Why this matters beyond `GIT_TERMINAL_PROMPT`: on an HTTPS remote with no
+/// cached credential, GCM is a SEPARATE GUI process that pops its own sign-in
+/// WINDOW — `GIT_TERMINAL_PROMPT=0` (git's terminal prompt) and `CREATE_NO_WINDOW`
+/// (git's console flash) do NOT stop it. Left interactive, the automatic
+/// background fetch spawns a storm of auth windows (one per repo, every poll) that
+/// reads as malware to endpoint protection. `credential.interactive=false` is the
+/// config key GCM honors; `GCM_INTERACTIVE=never` is the belt-and-suspenders env
+/// for older GCM builds. The `-c` MUST precede the subcommand, so callers apply
+/// this BEFORE adding `-C <dir>` / the subcommand args.
+fn no_credential_prompt(cmd: &mut Command) -> &mut Command {
+    cmd.arg("-c")
+        .arg("credential.interactive=false")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+}
+
 /// Run `git -C <dir> <args...>` as a user-initiated action, returning git's own
 /// message either way: `Ok(message)` on a clean exit, `Err(message)` otherwise.
 /// Push/pull write their progress to stderr, so the message prefers stderr when
 /// stdout is empty (and vice-versa on failure). Never panics.
 ///
-/// Runs git NON-INTERACTIVELY so a network sync can never hang the async command
-/// waiting on a prompt: `GIT_TERMINAL_PROMPT=0` makes git's own credential prompt
-/// fail fast, and a `BatchMode=yes` ssh (with a bounded connect timeout) makes ssh
-/// refuse rather than block on a passphrase / unknown-host-key prompt. Both turn
-/// an otherwise-infinite wait into a clean `Err` the frontend can toast.
+/// Runs git NON-INTERACTIVELY (see [`no_credential_prompt`]) so a network sync can
+/// never hang waiting on a prompt: git's terminal prompt, a GUI credential helper
+/// (Git Credential Manager), and an ssh passphrase / host-key prompt are all
+/// suppressed. A sync that would otherwise prompt fails fast with a clean `Err`
+/// the frontend can toast, instead of blocking (or popping an auth window).
 fn run_git_action(dir: &str, args: &[&str]) -> Result<String, String> {
     if dir.is_empty() {
         return Err("no project folder".to_string());
     }
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    cmd.no_console_window();
+    no_credential_prompt(&mut cmd);
+    let output = cmd
         .arg("-C")
         .arg(dir)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -311,43 +350,73 @@ pub fn pull(dir: &str) -> Result<String, String> {
 /// regardless of transport, so they can never accumulate.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The outcome of a background fetch for one folder, surfaced to the frontend so a
+/// SILENT background-fetch failure can drive a subtle UI indicator instead of just
+/// leaving the ahead/behind count quietly stale.
+///
+/// `Skipped` (no remote / blank path) draws NO indicator — there is nothing to
+/// fetch. `Ok` is a clean fetch. `Failed` means the folder HAS a remote but the
+/// fetch did not complete (offline / missing credentials / timeout) — the ONE case
+/// the UI flags, so the user knows the count may be stale and can act on it.
+/// Serialized lowercase (`"skipped"` / `"ok"` / `"failed"`) for the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FetchStatus {
+    Skipped,
+    Ok,
+    Failed,
+}
+
 /// Fetch the project's remote-tracking refs so the local ahead/behind probe
 /// (which reads `@{upstream}`, advanced only by a fetch) reflects new remote
-/// commits. Returns whether a fetch actually ran successfully (clean, in-time
-/// exit).
+/// commits. Returns a [`FetchStatus`]: `Skipped` (no remote / blank path — nothing
+/// to fetch), `Ok` (clean fetch), or `Failed` (has a remote but the fetch did not
+/// complete).
 ///
-/// A folder with NO remote is skipped (`false`) rather than shelling out a doomed
-/// fetch. Otherwise the fetch runs NON-INTERACTIVELY (`GIT_TERMINAL_PROMPT=0`, an
-/// ssh `BatchMode` with a bounded connect timeout) so a background thread can
-/// never hang on a prompt, and under an OVERALL [`FETCH_TIMEOUT`] so it can never
-/// hang on the network either (offline / credential-less / unreachable → killed
-/// → `false`).
+/// The fetch runs NON-INTERACTIVELY (see [`no_credential_prompt`]: no terminal
+/// prompt, no GUI credential-helper window, ssh `BatchMode` + connect timeout) so
+/// a background thread can never hang on a prompt, and under an OVERALL
+/// [`FETCH_TIMEOUT`] so it can never hang on the network either (offline /
+/// credential-less / unreachable → killed → `Failed`).
 ///
 /// Worktree-safe: a fetch updates only refs (remote-tracking refs, `FETCH_HEAD`,
 /// and — under a non-default fetch refspec — at most other NON-checked-out branch
 /// refs); it never touches the index, the worktree, or the checked-out branch
 /// (git refuses to fetch into the checked-out branch), so it is safe to run while
 /// the user works in the repo.
-pub fn fetch_dir(dir: &str) -> bool {
+pub fn fetch_dir(dir: &str) -> FetchStatus {
     if dir.is_empty() || !has_remote(dir) {
-        return false;
+        return FetchStatus::Skipped;
     }
-    run_git_fetch(dir, FETCH_TIMEOUT)
+    if run_git_fetch(dir, FETCH_TIMEOUT) {
+        FetchStatus::Ok
+    } else {
+        FetchStatus::Failed
+    }
 }
 
 /// Run a bounded, non-interactive `git -C <dir> fetch`. Mirrors
-/// [`run_git_action`]'s guards (no credential prompt; ssh `BatchMode` + connect
-/// timeout) but adds an OVERALL wall-clock `timeout`: a stalled fetch is killed
-/// once the deadline passes so a background thread can never block indefinitely
-/// or accumulate across polls. stdio is nulled (the background path never reads
-/// fetch's output). Returns `true` only on a clean, in-time exit.
+/// [`run_git_action`]'s guards via [`no_credential_prompt`] (no terminal prompt,
+/// no GUI credential-helper window, ssh `BatchMode` + connect timeout) but adds an
+/// OVERALL wall-clock `timeout`: a stalled fetch is killed once the deadline
+/// passes so a background thread can never block indefinitely or accumulate across
+/// polls. stdio is nulled (the background path never reads fetch's output).
+/// Returns `true` only on a clean, in-time exit.
+///
+/// The credential-prompt suppression is load-bearing here: this is the AUTOMATIC
+/// fetch, fired on launch (every project, in parallel) and on a recurring poll, so
+/// an interactive credential helper would pop an auth window for every
+/// unauthenticated HTTPS remote on every cycle — an endless window storm rather
+/// than a one-off. Suppressed, an unauthenticated remote simply fails fast (the
+/// ahead/behind count stays at its last-fetched value) with no UI.
 fn run_git_fetch(dir: &str, timeout: Duration) -> bool {
-    let spawned = Command::new("git")
+    let mut cmd = Command::new("git");
+    cmd.no_console_window();
+    no_credential_prompt(&mut cmd);
+    let spawned = cmd
         .arg("-C")
         .arg(dir)
         .arg("fetch")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -379,21 +448,26 @@ fn run_git_fetch(dir: &str, timeout: Duration) -> bool {
     }
 }
 
-/// Fetch remote-tracking refs for every `path` in PARALLEL, best-effort. Each
-/// folder is fetched on its own thread (mirroring [`status_for_paths`]) so total
-/// latency tracks the slowest single repo, and a folder that can't fetch (no
-/// remote / offline / off-repo) is simply skipped without blocking the others.
-/// Never fails: there is nothing to report — the next status poll reads whatever
-/// refs were advanced.
-pub fn fetch_remotes(paths: &[String]) {
+/// Fetch remote-tracking refs for every `path` in PARALLEL, best-effort, returning
+/// each path's [`FetchStatus`] keyed by the path verbatim (so the frontend resolves
+/// each project's row directly). Each folder is fetched on its own thread
+/// (mirroring [`status_for_paths`]) so total latency tracks the slowest single
+/// repo, and a folder that can't fetch (no remote / offline / off-repo) never
+/// blocks the others. Never fails: a thread that somehow panics simply omits its
+/// entry, which the UI treats as "no indicator".
+pub fn fetch_remotes(paths: &[String]) -> HashMap<String, FetchStatus> {
     let handles: Vec<_> = paths
         .iter()
         .cloned()
-        .map(|path| thread::spawn(move || fetch_dir(&path)))
+        .map(|path| thread::spawn(move || (path.clone(), fetch_dir(&path))))
         .collect();
+    let mut map = HashMap::new();
     for handle in handles {
-        let _ = handle.join();
+        if let Ok((path, status)) = handle.join() {
+            map.insert(path, status);
+        }
     }
+    map
 }
 
 // ───────────────────────── branch operations ─────────────────────────
@@ -1340,11 +1414,20 @@ mod tests {
         let norem = TempRepo::new("bgfetch-batch-norem");
 
         // A mix of: a fetchable repo, a remoteless repo, and an off-repo path.
-        fetch_remotes(&[
+        let outcomes = fetch_remotes(&[
             repo.str().to_string(),
             norem.str().to_string(),
             "/definitely/not/a/repo/anywhere".to_string(),
         ]);
+
+        // Each path reports its own outcome: the fetchable repo Ok, the remoteless
+        // repo and the off-repo path Skipped (nothing to fetch — no indicator).
+        assert_eq!(outcomes.get(repo.str()), Some(&FetchStatus::Ok));
+        assert_eq!(outcomes.get(norem.str()), Some(&FetchStatus::Skipped));
+        assert_eq!(
+            outcomes.get("/definitely/not/a/repo/anywhere"),
+            Some(&FetchStatus::Skipped)
+        );
 
         // The good repo was fetched (behind now reflects the remote)...
         assert_eq!(
@@ -1364,11 +1447,30 @@ mod tests {
     #[test]
     fn fetch_dir_is_a_safe_no_op_for_a_remoteless_or_bogus_folder() {
         // fetch_dir directly: a repo with no remote has nothing to fetch, and an
-        // off-repo / blank path is a safe no-op — never a panic/error.
+        // off-repo / blank path is a safe no-op (Skipped) — never a panic/error,
+        // and never Failed (Skipped draws no UI indicator).
         let repo = TempRepo::new("bgfetch-norem");
-        assert!(!fetch_dir(repo.str()), "a repo with no remote does not fetch");
-        assert!(!fetch_dir("/definitely/not/a/repo/anywhere"), "off-repo is a no-op");
-        assert!(!fetch_dir(""), "a blank dir is a no-op");
+        assert_eq!(fetch_dir(repo.str()), FetchStatus::Skipped, "no remote → Skipped");
+        assert_eq!(
+            fetch_dir("/definitely/not/a/repo/anywhere"),
+            FetchStatus::Skipped,
+            "off-repo → Skipped"
+        );
+        assert_eq!(fetch_dir(""), FetchStatus::Skipped, "blank dir → Skipped");
+    }
+
+    #[test]
+    fn fetch_dir_reports_failed_when_a_configured_remote_cannot_be_reached() {
+        // A repo that HAS a remote but cannot reach it fails fast (the local path
+        // remote does not exist) — the one case surfaced to the UI as Failed, so a
+        // stale ahead/behind count becomes visible rather than silent.
+        let repo = TempRepo::new("bgfetch-failed");
+        run(repo.str(), &["remote", "add", "origin", "/nonexistent/bare/repo.git"]);
+        assert_eq!(
+            fetch_dir(repo.str()),
+            FetchStatus::Failed,
+            "a configured-but-unreachable remote reports Failed"
+        );
     }
 
     #[cfg(unix)]

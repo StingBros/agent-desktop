@@ -22,6 +22,8 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
+use crate::no_window::NoConsoleWindow;
+
 /// The transcription tier the user selected (mirrors the `voice.modelTier`
 /// setting: `fast` → small final model, `accurate` → large-v3-turbo final model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +397,7 @@ async fn download_one(
     // fill the stderr pipe); -S: still surface the error text; -L: follow the
     // HF → signed-CDN redirect. `--retry` rides out transient resets.
     let mut child = tokio::process::Command::new("curl")
+        .no_console_window()
         .args(["-fsSL", "--retry", "3", "--retry-delay", "1", "-o"])
         .arg(&part_path)
         .arg(spec.url)
