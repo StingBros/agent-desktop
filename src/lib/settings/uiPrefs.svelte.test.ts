@@ -37,7 +37,8 @@ describe('parseUiPrefs', () => {
       terminalsWidth: 500,
       tasksLauncherFrac: 0.4,
       projectFilter: 'proj-123',
-      laneOrder: { attn: ['a', 'b'], paused: ['c'] }
+      laneOrder: { attn: ['a', 'b'], paused: ['c'] },
+      lastSessionByProject: { 'proj-123': 'sess-abc' }
     };
     expect(parseUiPrefs(raw)).toEqual(raw);
   });
@@ -72,6 +73,23 @@ describe('parseUiPrefs', () => {
     expect(parsed.tasksLauncherFrac).toBe(DEFAULT_UI_PREFS.tasksLauncherFrac);
     expect(parsed.projectFilter).toBe(DEFAULT_UI_PREFS.projectFilter);
     expect(parsed.laneOrder).toEqual({ attn: ['ok', 'fine'], paused: [] });
+  });
+
+  it('defaults lastSessionByProject to an empty map', () => {
+    expect(parseUiPrefs({}).lastSessionByProject).toEqual({});
+    expect(DEFAULT_UI_PREFS.lastSessionByProject).toEqual({});
+  });
+
+  it('keeps only string→non-empty-string entries of lastSessionByProject', () => {
+    const parsed = parseUiPrefs({
+      lastSessionByProject: { a: 'sess-a', b: 42, c: '', d: null, e: 'sess-e' }
+    });
+    expect(parsed.lastSessionByProject).toEqual({ a: 'sess-a', e: 'sess-e' });
+  });
+
+  it('drops a non-object / array lastSessionByProject', () => {
+    expect(parseUiPrefs({ lastSessionByProject: 'nope' }).lastSessionByProject).toEqual({});
+    expect(parseUiPrefs({ lastSessionByProject: ['a', 'b'] }).lastSessionByProject).toEqual({});
   });
 });
 
@@ -112,5 +130,48 @@ describe('UiPrefsStore', () => {
     const store = new UiPrefsStore();
     store.setTerminalsWidth(100000);
     expect(store.data.terminalsWidth).toBe(TERMINALS_WIDTH_MAX);
+  });
+
+  it('records the last session for a project and persists it', async () => {
+    const store = new UiPrefsStore();
+    invokeMock.mockResolvedValueOnce(null).mockResolvedValueOnce(undefined);
+    store.setLastSessionForProject('proj-1', 'sess-1');
+    expect(store.data.lastSessionByProject).toEqual({ 'proj-1': 'sess-1' });
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+    const saveCall = invokeMock.mock.calls.find((c) => c[0] === 'settings_save');
+    expect(saveCall).toBeTruthy();
+    const saved = JSON.parse((saveCall![1] as { json: string }).json);
+    expect(saved.ui.lastSessionByProject).toEqual({ 'proj-1': 'sess-1' });
+  });
+
+  it('setLastSessionForProject is a no-op (no write) when unchanged or blank', async () => {
+    const store = new UiPrefsStore();
+    store.setLastSessionForProject('proj-1', 'sess-1');
+    // Let the first (legitimate) save fully settle so its async invoke can't land
+    // after mockClear and pollute the no-op assertion below.
+    await new Promise((r) => setTimeout(r, 0));
+    const before = store.data;
+    invokeMock.mockClear();
+    // Same value → no state change, no save.
+    store.setLastSessionForProject('proj-1', 'sess-1');
+    expect(store.data).toBe(before);
+    // Blank ids → ignored.
+    store.setLastSessionForProject('', 'sess-x');
+    store.setLastSessionForProject('proj-2', '');
+    expect(store.data).toBe(before);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(invokeMock.mock.calls.some((c) => c[0] === 'settings_save')).toBe(false);
+  });
+
+  it('keeps prior projects when recording another (per-project map)', () => {
+    const store = new UiPrefsStore();
+    store.setLastSessionForProject('proj-1', 'sess-1');
+    store.setLastSessionForProject('proj-2', 'sess-2');
+    store.setLastSessionForProject('proj-1', 'sess-1b');
+    expect(store.data.lastSessionByProject).toEqual({
+      'proj-1': 'sess-1b',
+      'proj-2': 'sess-2'
+    });
   });
 });

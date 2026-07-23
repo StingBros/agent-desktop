@@ -185,6 +185,43 @@ The system SHALL provide a project panel (shared by both overviews) that filters
 - **WHEN** a project has both an agent that needs the user (waiting/errored) and another that is actively working
 - **THEN** the panel shows the needs-you (attention) indicator, not the working one
 
+### Requirement: Default-Select The Last Used Session When Opening A Project
+When the user OPENS a project (selects a concrete project in the panel — not the
+"All agents" or unassigned buckets), the system SHALL restore that project's RECORDED
+last-used session in the focus pane, so the user lands back where they left off rather
+than on a blank pane or an arbitrary agent. The system SHALL continuously record, per
+project, the session shown in the focus pane, keyed by the session's STABLE identifier
+(surviving app restart and `--resume`) and persisted in the durable UI preferences.
+Restoration is deliberately CONSERVATIVE: the recorded session is restored ONLY when a
+LIVE (non-archived) session with that id is still present; if nothing is recorded, the
+recorded session is gone, or it is now archived, the system SHALL make NO change and
+the normal focus resolution applies (attention agent, else "All clear"). Restoration
+SHALL NOT resume or preview an archived session, so opening or cycling through projects
+never spawns a session process as a side effect of navigation. Recording SHALL be a
+no-op when unchanged (so steady-state polling never writes) and SHALL never store an
+entry for a session with no project or no stable id.
+
+#### Scenario: Opening a project restores its recorded last used session
+- **WHEN** the user selects a concrete project whose recorded last-used session is
+  still present as a live session in the roster
+- **THEN** the focus pane shows that session, rather than a blank pane or an agent the
+  user did not last use
+
+#### Scenario: A project with no recorded (or a stale) session is unaffected
+- **WHEN** the user opens a project that has no recorded last-used session, or whose
+  recorded session no longer exists
+- **THEN** no default selection is applied and the normal focus resolution stands
+  (the first attention agent, else "All clear")
+
+#### Scenario: An archived recorded session is not auto-resumed on open
+- **WHEN** the user opens a project whose recorded last-used session is now archived
+- **THEN** the archived session is NOT selected or resumed, no session process is
+  spawned, and the normal focus resolution stands
+
+#### Scenario: Non-project selections are unaffected
+- **WHEN** the user selects "All agents" or the unassigned bucket
+- **THEN** no last-used-session default is applied; the existing focus behavior stands
+
 ### Requirement: Reorder Projects By Dragging
 The system SHALL let the user reorder the project list by dragging a project row
 onto another, moving the dragged project to the drop target's slot. The new order

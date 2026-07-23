@@ -5,6 +5,7 @@ import {
   isAttention,
   attentionQueue,
   resolveFocus,
+  resolveProjectDefaultSession,
   nextInQueue,
   nextOnDismiss,
   shouldClearPin,
@@ -129,6 +130,47 @@ describe('Focus is empty when nothing needs attention and nothing is selected', 
   it('returns null', () => {
     const rows = [row('a', 'working'), row('b', 'finished')];
     expect(resolveFocus(rows, null)).toBe(null);
+  });
+});
+
+describe('resolveProjectDefaultSession — restore the recorded last used session on open', () => {
+  // sessionIdOf maps a row to a stable session id via an explicit paneId→sid table,
+  // mirroring how the component resolves it from the workspace registry.
+  const sidOf = (table: Record<string, string>) => (r: AgentRow) => table[r.paneId] ?? null;
+
+  it('restores the recorded session when a LIVE row with that id is present', () => {
+    const rows = [row('a', 'working'), row('b', 'waiting'), row('c', 'finished')];
+    const table = { a: 'sess-a', b: 'sess-b', c: 'sess-c' };
+    expect(resolveProjectDefaultSession(rows, 'sess-b', sidOf(table))?.paneId).toBe('b');
+  });
+
+  it('returns null when nothing is recorded (caller keeps its normal focus)', () => {
+    const rows = [row('a', 'working', { lastTs: 100 }), row('b', 'waiting', { lastTs: 300 })];
+    // No MRU guess — a null recorded id yields null, never an arbitrary row.
+    expect(resolveProjectDefaultSession(rows, null, sidOf({ a: 'sess-a', b: 'sess-b' }))).toBeNull();
+  });
+
+  it('returns null when the recorded session is no longer present (deleted)', () => {
+    const rows = [row('a', 'working'), row('b', 'idle')];
+    expect(resolveProjectDefaultSession(rows, 'sess-gone', sidOf({ a: 'sess-a' }))).toBeNull();
+  });
+
+  it('does NOT restore a recorded session that is now archived (no auto-resume on open)', () => {
+    // The recorded session still exists but is closed → excluded, so opening the
+    // project never spawns a preview; caller falls through to normal focus.
+    const rows = [row('a', 'working'), row('b', 'finished', { closed: true })];
+    expect(resolveProjectDefaultSession(rows, 'sess-b', sidOf({ a: 'sess-a', b: 'sess-b' }))).toBeNull();
+  });
+
+  it('returns null when the project has no rows', () => {
+    expect(resolveProjectDefaultSession([], 'sess-x', sidOf({}))).toBeNull();
+  });
+
+  it('never false-matches a row whose sessionIdOf is null', () => {
+    const rows = [row('a', 'working')];
+    // sidOf returns null for 'a'; a null recorded id would also be a no-op, but here
+    // the recorded id is a real string that must not match the null-id row.
+    expect(resolveProjectDefaultSession(rows, 'sess-x', sidOf({}))).toBeNull();
   });
 });
 

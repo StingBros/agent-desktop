@@ -38,6 +38,7 @@
     isAttention,
     attentionQueue,
     resolveFocus,
+    resolveProjectDefaultSession,
     nextInQueue,
     nextOnDismiss,
     archiveDecision,
@@ -578,6 +579,63 @@
       userSelected = null;
       shownId = next;
     }, ADVANCE_DELAY_MS);
+  });
+
+  // Default-select the last used session when the user OPENS a project — i.e. the
+  // project filter changes to a CONCRETE project. Restores the project's recorded
+  // last-used session when a LIVE row with that stable id is still present (see
+  // `resolveProjectDefaultSession`); in every other case it does nothing and the
+  // reconcile effect above resolves focus as before (attention agent / All-clear).
+  // Only ever `selectAgent` (never a preview spawn) — the resolver excludes archived
+  // rows, so opening or keyboard-cycling projects can never respawn a `claude --resume`
+  // as a side effect of navigation. Skips ALL / UNASSIGNED (no single project) and the
+  // first hydrated run (so it fires on an actual open, not on app launch — a launch-time
+  // restore is intentionally out of scope, as the roster may not have populated yet).
+  // Gated on `uiPrefs.loaded` so the persisted map is present before the first switch.
+  //
+  // Ordering matters: this effect is created BEFORE the recorder below so that, within
+  // the single flush a project switch triggers, it reads the UNCORRUPTED stored value
+  // and pins the restored session BEFORE the recorder observes the settled focus — else
+  // the reconcile effect's transient attention pick would be recorded over the real
+  // last-used session and the restore would be defeated.
+  let lastProjectSel: string | null = null;
+  let projectSelSeeded = false;
+  $effect(() => {
+    if (!uiPrefs.loaded) return;
+    const sel = projectFilter.selected;
+    if (!projectSelSeeded) {
+      lastProjectSel = sel;
+      projectSelSeeded = true;
+      return;
+    }
+    if (sel === lastProjectSel) return;
+    lastProjectSel = sel;
+    if (sel === ALL || sel === UNASSIGNED) return;
+    const last = uiPrefs.data.lastSessionByProject[sel] ?? null;
+    const target = resolveProjectDefaultSession(viewRows, last, sessionIdOf);
+    if (target) selectAgent(target.paneId);
+  });
+
+  // Record the session shown in the focus pane as PER-PROJECT last-used, so the effect
+  // above can restore it on a later open. Keyed by the STABLE registry sessionId
+  // (survives restart / `--resume`), not the paneId. Created AFTER the restore effect
+  // (see its ordering note) so it observes the SETTLED focus, never the reconcile
+  // transient. Gated on `uiPrefs.loaded` so a pre-hydrate focus can't persist a
+  // defaults-only `ui` slice over the user's real prefs. `setLastSessionForProject`
+  // no-ops when unchanged (so steady-state roster ticks never write); a genuine focus
+  // move to a new session persists once, matching the codebase's other discrete
+  // (non-debounced) `ui` setters. Only project-bound, resumable sessions are recorded
+  // (null projectId / sessionId skipped), so the UNASSIGNED bucket gets no entry.
+  $effect(() => {
+    if (!uiPrefs.loaded) return;
+    const r = focus;
+    if (!r || !r.projectId || r.closed) return;
+    // Skip ARCHIVED rows (symmetric with the resolver's read-side `!r.closed`
+    // filter): previewing an archived session must not overwrite the project's
+    // live last-used session, which the resolver would then refuse to restore.
+    const sid = sessionIdOf(r);
+    if (!sid) return;
+    uiPrefs.setLastSessionForProject(r.projectId, sid);
   });
 
   // Immediately switch to a session the user just created (in-inbox "+" or the

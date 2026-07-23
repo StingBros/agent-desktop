@@ -126,6 +126,34 @@ export function resolveFocus(rows: AgentRow[], userSelected: string | null): Age
 }
 
 /**
+ * PURE: the session to default-select when a project is OPENED — "where the user
+ * left off". Deliberately CONSERVATIVE: it restores ONLY the project's explicitly
+ * recorded last-used session (`lastSessionId`), and only when a LIVE (non-closed)
+ * row with that STABLE session id is still present. It returns null in every other
+ * case — no recorded id, the recorded session is gone, or it is now archived — so the
+ * caller falls through to the normal focus resolution (attention agent, else "All
+ * clear") UNCHANGED.
+ *
+ * Why so narrow (see the adversarial review that shaped this):
+ *   - NO most-recently-active guess: picking an arbitrary MRU row on open would bury
+ *     an agent that needs the user behind one that doesn't (a focus regression).
+ *   - NO archived rows: a closed row is never auto-selected, so opening/cycling
+ *     projects can never spawn a `claude --resume` preview as a navigation side effect.
+ *
+ * `rows` are the target project's rows (the caller filters by project). `sessionIdOf`
+ * maps a row to its stable session id (null for a non-resumable pane), injected so
+ * this stays framework-free and unit-testable. Never mutates `rows`.
+ */
+export function resolveProjectDefaultSession(
+  rows: AgentRow[],
+  lastSessionId: string | null,
+  sessionIdOf: (r: AgentRow) => string | null
+): AgentRow | null {
+  if (!lastSessionId) return null;
+  return rows.find((r) => !r.closed && sessionIdOf(r) === lastSessionId) ?? null;
+}
+
+/**
  * PURE: the focus target after the user EXPLICITLY dismisses the shown session
  * (archive / pause / delete) — the next actionable session, excluding the
  * dismissed pane, chosen in roster (display) order:

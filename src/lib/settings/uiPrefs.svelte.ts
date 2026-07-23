@@ -50,6 +50,11 @@ export interface UiPrefs {
   tasksLauncherFrac: number;
   projectFilter: string;
   laneOrder: LaneOrderPrefs;
+  /** The most-recently-active session per project — a map of project id → the
+   *  session's STABLE registry sessionId (survives restart / `--resume`, unlike a
+   *  paneId). Lets opening a project restore where the user left off (default-select
+   *  the last used session). A project absent from the map has no recorded session. */
+  lastSessionByProject: Record<string, string>;
 }
 
 /** Defaults for a fresh install. */
@@ -58,7 +63,8 @@ export const DEFAULT_UI_PREFS: UiPrefs = {
   terminalsWidth: TERMINALS_WIDTH_DEFAULT,
   tasksLauncherFrac: TASKS_FRAC_DEFAULT,
   projectFilter: PROJECT_FILTER_DEFAULT,
-  laneOrder: { attn: [], paused: [] }
+  laneOrder: { attn: [], paused: [] },
+  lastSessionByProject: {}
 };
 
 /** Clamp a terminals-panel width into [MIN, MAX] (rounded). */
@@ -74,6 +80,18 @@ export function clampTasksFrac(f: number): number {
 /** PURE: keep only the string entries of an arbitrary value (else []). */
 function stringIds(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+
+/** PURE: keep only the string→NON-EMPTY-string entries of an arbitrary value (else
+ *  {}). Used to normalize the persisted `lastSessionByProject` map — a non-object,
+ *  an array, or a non-string / empty value is dropped per key. */
+function stringStringRecord(v: unknown): Record<string, string> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+  const out: Record<string, string> = {};
+  for (const [key, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val === 'string' && val !== '') out[key] = val;
+  }
+  return out;
 }
 
 /**
@@ -108,7 +126,8 @@ export function parseUiPrefs(raw: unknown): UiPrefs {
       typeof o.projectFilter === 'string' && o.projectFilter !== ''
         ? o.projectFilter
         : PROJECT_FILTER_DEFAULT,
-    laneOrder: { attn: stringIds(laneRaw.attn), paused: stringIds(laneRaw.paused) }
+    laneOrder: { attn: stringIds(laneRaw.attn), paused: stringIds(laneRaw.paused) },
+    lastSessionByProject: stringStringRecord(o.lastSessionByProject)
   };
 }
 
@@ -169,6 +188,20 @@ export class UiPrefsStore {
   /** Set the manual lane order (attn + paused) and persist (best-effort). */
   setLaneOrder(order: LaneOrderPrefs): void {
     this.data = { ...this.data, laneOrder: { attn: [...order.attn], paused: [...order.paused] } };
+    void this.save();
+  }
+
+  /** Record `sessionId` as the most-recently-active session for `projectId` and
+   *  persist (best-effort). A NO-OP (no state change, no write) when it already
+   *  matches or when either id is blank — so this can be called from a reactive
+   *  effect on every focus tick without thrashing the `settings.json` write. */
+  setLastSessionForProject(projectId: string, sessionId: string): void {
+    if (!projectId || !sessionId) return;
+    if (this.data.lastSessionByProject[projectId] === sessionId) return;
+    this.data = {
+      ...this.data,
+      lastSessionByProject: { ...this.data.lastSessionByProject, [projectId]: sessionId }
+    };
     void this.save();
   }
 
