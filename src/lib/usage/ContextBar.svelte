@@ -3,22 +3,27 @@
   // by fullness), then the colored StatusBar to the RIGHT of the percent. A dim
   // dash + striped bar when unknown.
   import StatusBar from './StatusBar.svelte';
-  import { barColor } from './barColor';
+  import { contextColor } from './barColor';
 
   let { pct }: { pct: number | null } = $props();
 
   function fmt(value: number | null): string {
     return value === null ? '—' : `${Math.round(value)}%`;
   }
+
+  // The context bar warns earlier than the account limit bars (yellow >25%, red
+  // >30%); one color drives BOTH the percent text and the StatusBar fill.
+  const color = $derived(contextColor(pct));
 </script>
 
 <div class="ctx" aria-label="Focused pane context window used">
   <span class="label">ctx</span>
-  <span class="val" class:dim={pct === null} style:color={pct === null ? null : barColor(pct)}>
+  <span class="val" class:dim={pct === null} style:color={pct === null ? null : color}>
     {fmt(pct)}
   </span>
   <StatusBar
     {pct}
+    {color}
     label={pct === null
       ? 'Context window — usage unknown'
       : `Context window — ${Math.round(pct)}% of the focused agent's context used`}

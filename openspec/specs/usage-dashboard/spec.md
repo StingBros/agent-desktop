@@ -123,6 +123,20 @@ The system SHALL derive context from `used_percentage`/`remaining_percentage`/`c
 - **WHEN** a pane's snapshot has `context_pct` of null
 - **THEN** that pane's card renders its context bar in an empty/unknown state rather than throwing or showing a misleading 0%
 
+### Requirement: Footer context bar escalates color earlier than the limit bars
+
+The footer CONTEXT bar (its percent text and fill) SHALL escalate color on more
+aggressive thresholds than the account rate-limit bars, so a filling context window
+warns early: GREEN below 25% used, YELLOW at/above 25%, and RED at/above 30%. These
+thresholds apply ONLY to the context bar; the 5-hour / 7-day limit bars SHALL keep
+their own thresholds (yellow at 50%, red at 80%). An unknown context renders the
+neutral/unknown state, not a color.
+
+#### Scenario: Context bar colors on the 25 / 30 thresholds
+- **WHEN** the focused pane's context used is 24%, 27%, and 35%
+- **THEN** the context bar reads green, yellow, and red respectively
+- **AND** a limit bar at the same 27% still reads green (its yellow threshold is 50%)
+
 ### Requirement: Footer shows the focused session's model and effort
 
 The footer SHALL display the focused session's MODEL and reasoning EFFORT as two

@@ -5,15 +5,22 @@
   import { barColor } from './barColor';
   import { tooltip } from '$lib/ui/tooltip';
 
-  let { pct, label }: { pct: number | null; label?: string } = $props();
+  // `color` overrides the fill color when provided (e.g. the context bar uses its
+  // own more-aggressive thresholds); otherwise the fill uses the default `barColor`.
+  let {
+    pct,
+    label,
+    color
+  }: { pct: number | null; label?: string; color?: string } = $props();
 
   const known = $derived(pct !== null && Number.isFinite(pct));
   const width = $derived(known ? Math.max(0, Math.min(100, pct as number)) : 0);
+  const fill = $derived(color ?? barColor(pct));
 </script>
 
 <div class="bar" class:unknown={!known} use:tooltip={label ?? ''}>
   {#if known}
-    <div class="fill" style:width={`${width}%`} style:background={barColor(pct)}></div>
+    <div class="fill" style:width={`${width}%`} style:background={fill}></div>
   {/if}
 </div>
 
