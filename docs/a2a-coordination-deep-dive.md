@@ -280,8 +280,36 @@ Phases 1–2 are the ones that make it *feel* coordinated; 3 is what makes it
 
 ## 7. Open questions to decide together
 
-- **Where does Task state live?** Per-project `.agent-desktop/` JSON (consistent
-  with existing tasks/config storage) vs. an in-memory frontend store vs. Rust.
+- **Where does Task state live?** *(discussed 2026-07-25 — leaning event-sourced)*
+  Ranked for this app:
+  1. **Event-sourced task board (preferred).** Add `task_assigned/progress/
+     blocked/done/failed` as new kinds on the *existing* event pipeline
+     (`event-hook.cjs` → `events.rs` → append-only `events/<sessionId>.jsonl`);
+     derive the board as a Svelte runes projection (a fold), exactly like status.
+     No new storage subsystem; append-only sidesteps write contention; audit +
+     attribution fall out for free.
+  2. **Per-project JSON snapshot** — `.agent-desktop/coordinator-tasks.json`,
+     sibling to `tasks.json`/`config.json`. Matches convention, human-readable,
+     git-diffable. Cost: whole-file rewrites + must serialize writes (Rust owns
+     the writer). The pragmatic "just ship it" option.
+  3. **SQLite (escalation only)** — Tauri SQL plugin / `rusqlite`. Real
+     queries/transactions/indexes; adopt when cross-project queries, analytics,
+     or task volume demand it. Not a starting point (binary file, migrations,
+     overkill for a per-project fleet).
+  4. **Pure in-memory (runes) — avoid alone.** Loses the coordinator's plan on
+     crash, exactly when it's wanted; only acceptable backed by 1–3.
+
+  Supporting decisions:
+  - **Single-writer authority:** the frontend `OrchestrationExecutor` is the only
+    mutator of task state (coordinator + workers both funnel through it via the
+    Rust socket); Rust per-target serialization gives ordering. Prevents
+    split-brain — matters more than the backend choice.
+  - **Artifacts by reference, not inline:** `report_done` payloads (diffs, files,
+    summaries) live on disk; the Task holds a pointer. Respects MCP output caps
+    (~10k warn / ~25k cap tokens).
+  - **Sync with Claude Code's own task list:** map a coordinator Task onto the
+    worker's `~/.claude/tasks/<session>/` `in_progress` todo so the roster's
+    per-agent task label lights up for free and stays in sync.
 - **Does the coordinator stay an in-pane LLM (A/B) or become a real engine (C)?**
   This is the biggest fork; A is reversible, C is a commitment.
 - **How much autonomy** should the coordinator have when a child escalates —
