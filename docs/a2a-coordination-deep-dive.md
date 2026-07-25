@@ -38,6 +38,28 @@ re-reading scraped terminal text every turn.
 
 ---
 
+## 0. Confirmed direction (2026-07-25)
+
+Two hard constraints agreed for every option below:
+
+- **The coordinator stays a chat surface.** It remains an interactive Claude
+  conversation the user manages the fleet through — in *all* options, including
+  the Option C engine. Moving control-flow to an engine changes how the
+  coordinator drives *other* agents (the back office), never the human↔coordinator
+  conversation. Its own pane may *additively* grow a task-board/team view
+  alongside the chat; it never replaces the chat.
+- **Workers/specialists stay real `claude` CLI.** They remain raw PTY terminals,
+  unchanged in feel. The structured signal comes from the worker *calling* a
+  back-channel tool, not from restructuring or scraping its terminal — so Phase 1
+  (Option A) delivers the coordination win without touching worker rendering.
+
+Consequence: **Option B's stream-json worker view is de-prioritized** — it trades
+away the "feels like `claude` CLI" property for the same worker, which we don't
+want. Revisit B only as an opt-in per worker if keystroke injection into busy
+workers remains a pain point at scale.
+
+---
+
 ## 1. What you already have (don't rebuild this)
 
 Grounded from the code, not the specs:
