@@ -164,6 +164,40 @@ Rollback = revert the change; older builds simply ignore the new JSON file and t
 new env var. The new bundled `back-channel-mcp.cjs` installs alongside the existing
 sidecars and is only referenced when a worker is dispatched with a Task.
 
+## Adversarial review outcome (pre-archive gate)
+
+Three independent skeptical reviewers ran over the full implementation diff.
+**No CRITICAL findings** — the state machine, terminal-state integrity, id
+generation, fail-closed scoping, launch wiring, Rust path safety, socket
+serialization/reply-routing, `notifyCoordinator`, and `reconcileOnPaneExit` were
+all confirmed sound. The `tauri.conf.json` `resources[]` question was resolved as
+a non-issue: the `.cjs` sidecars are baked via `include_str!` and installed to
+app-data at runtime (like `statusline-wrapper`/`event-hook`, also absent from
+`resources[]`), so a packaged build installs and launches the back-channel sidecar
+correctly.
+
+**Fixed (functional WARNINGs):**
+- *report_done / pane-exit race* — `reportDone` re-fetches the task and re-checks
+  terminal state after the `writeArtifact` await; a worker pane dying mid-write can
+  no longer turn completed work into a thrown `failed → done`. Returns a benign
+  result instead.
+- *Durability* — `taskBoard.register(projectId, path)` records the board path for a
+  project created mid-session (so its tasks persist), and `taskBoard.flushAll()` on
+  app-quit flushes pending debounced saves so a just-assigned task isn't lost.
+
+**Consciously accepted (documented, not blocking):**
+- *Fixed `.json.tmp` temp names* in `tasks_store.rs` — matches the established
+  `project_store` repo convention; per-project writes are serialized by the single
+  debounce timer. Revisit repo-wide if EDR-induced write stalls prove it matters.
+- *`load()` re-invoke* — currently one-shot at mount (not reachable while a
+  coordinator runs); a merge-by-id hydrate would harden a future re-activation path.
+- *`projectId` fail-closed symmetry* and *back-channel `.catch`* — both unreachable
+  in practice and consistent with the shipped `orchestration-mcp.cjs`; worth a
+  shared hardening pass someday.
+- Cosmetic: surrogate-splitting in truncated inline previews (display-only, full
+  text is preserved in the artifact); lexicographic id tie-break on an unreachable
+  exact-timestamp tie.
+
 ## Open Questions
 
 - **Worker reuse:** `assign_task` always spawns a fresh worker in this change.
