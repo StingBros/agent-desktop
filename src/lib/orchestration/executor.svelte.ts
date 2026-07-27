@@ -730,7 +730,27 @@ export class OrchestrationExecutor {
       }
     }
 
-    this.ensureWorking(projectId, task);
+    // STALE-SNAPSHOT GUARD: `task` was snapshotted before the (possibly slow)
+    // `writeArtifact` await above. During that await the worker's pane can exit and
+    // `reconcileOnPaneExit` — invoked DIRECTLY from the pane-exit path, not serialized
+    // through the socket/TargetQueues — can transition this Task to `failed`. Re-fetch
+    // the live Task and bail benignly if it is gone or already terminal, rather than
+    // forcing it back to `working` off a stale snapshot and then throwing an illegal
+    // `failed → done` transition. The completion is simply dropped; the board's
+    // terminal state (the durable record) wins.
+    const live = this.deps.getTask(projectId, task.id);
+    if (!live || TERMINAL_STATES.has(live.state)) {
+      return {
+        result: {
+          ok: false,
+          taskId: task.id,
+          state: live?.state ?? 'gone',
+          note: 'task reached a terminal state before completion was recorded'
+        }
+      };
+    }
+
+    this.ensureWorking(projectId, live);
     const done = this.deps.transitionTask(projectId, task.id, 'done', {
       result: inlineResult,
       artifacts,

@@ -109,6 +109,32 @@ class TaskBoardStore {
   }
 
   /**
+   * Record a project's `projectId → projectPath` mapping WITHOUT a disk read, so a
+   * project added mid-session (never {@link load}ed) can still have its mutations
+   * flushed to the right place. The in-memory board for that project is left as-is
+   * (empty for a brand-new project); this only teaches {@link persistNow} the path.
+   * Registering an already-known project again is harmless (it re-records the same
+   * path). Unlike {@link load}, this never touches disk and never seeds the id counter.
+   */
+  register(projectId: string, projectPath: string): void {
+    this.paths[projectId] = projectPath;
+  }
+
+  /**
+   * Flush every project with a PENDING debounced save immediately, cancelling its
+   * timer and firing the save synchronously (mirroring the debounced {@link persistNow}
+   * call). Called on app quit so a mutation in the last {@link PERSIST_DEBOUNCE_MS}
+   * before close — still sitting behind its debounce timer — is not lost.
+   */
+  flushAll(): void {
+    for (const projectId of Object.keys(this.persistTimers)) {
+      clearTimeout(this.persistTimers[projectId]);
+      delete this.persistTimers[projectId];
+      this.persistNow(projectId);
+    }
+  }
+
+  /**
    * Serialize a project's board and persist it via the Rust `coordinator_tasks_save`
    * command. No-op (with a warning) when the project's path is unknown — a project
    * must be {@link load}ed before its mutations can be flushed.

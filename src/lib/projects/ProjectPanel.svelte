@@ -14,6 +14,7 @@
   import type { AgentRow } from '../overview/roster';
   import type { Project, ProjectDraft } from './projects';
   import { projects } from './projects.svelte';
+  import { taskBoard } from '../orchestration/taskBoard.svelte';
   import { saveAutoWorktree } from './projectFolderConfig';
   import { projectFilter } from './projectFilter.svelte';
   import {
@@ -178,6 +179,9 @@
     // folder is re-added. Absent config already means `false`.
     const { autoWorktree, ...record } = draft;
     const stored = await projects.add({ id: crypto.randomUUID(), ...record });
+    // Register the new project's path with the coordinator task board so its
+    // mutations debounce-persist (a mid-session project is never `load`ed at mount).
+    taskBoard.register(stored.id, stored.path);
     if (autoWorktree === true) {
       await saveAutoWorktree(stored.path, autoWorktree);
     }

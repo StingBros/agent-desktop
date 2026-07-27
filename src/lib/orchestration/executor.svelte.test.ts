@@ -652,6 +652,41 @@ describe('OrchestrationExecutor — back-channel reports (tasks 5.1–5.4)', () 
     expect(taskBoard.getTask(proj, t.id)!.state).toBe('working');
   });
 
+  it('report_done returns a benign result (no throw) when the pane exits mid-write', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working', assigneePaneId: 'w1' });
+    // A large result forces the `writeArtifact` await; the mock simulates the
+    // pane-exit reconcile firing DURING that await, transitioning the Task to
+    // `failed` before the write resolves (the stale-snapshot race).
+    const big = 'y'.repeat(2001); // > RESULT_INLINE_MAX (2000) → by-reference write
+    let ex!: OrchestrationExecutor;
+    const ctx = setup({
+      locate: () => pane('w1', { projectId: proj }) as any,
+      writeArtifact: async (_projectPath, taskId, name) => {
+        ex.reconcileOnPaneExit('w1'); // pane exits mid-write → Task → failed
+        return `.agent-desktop/artifacts/${taskId}/${name}`;
+      }
+    });
+    ex = ctx.ex;
+    const { replies, notify } = ctx;
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: big }
+    });
+    // The reconcile's terminal `failed` state wins; no illegal `failed → done`
+    // transition is attempted and no error propagates — the worker gets a clean,
+    // benign reply and the Task is NOT forced back to working/done.
+    expect(taskBoard.getTask(proj, t.id)!.state).toBe('failed');
+    expect(replies[0].outcome.error).toBeUndefined();
+    expect(replies[0].outcome.result).toMatchObject({
+      ok: false,
+      taskId: t.id,
+      state: 'failed'
+    });
+    expect(notify).not.toHaveBeenCalled(); // no `done` notification for a dropped completion
+  });
+
   // ── Single-writer serialization (task 5.4) ───────────────────────────────────
 
   it('applies two reports to the same Task in order (single writer)', async () => {

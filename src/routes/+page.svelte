@@ -228,6 +228,9 @@
     void getCurrentWindow()
       .onCloseRequested(async () => {
         await projectTasks.captureRunningAndSave();
+        // Flush any pending debounced coordinator-task-board save so a mutation in
+        // the last PERSIST_DEBOUNCE_MS before quit is not lost with its timer.
+        taskBoard.flushAll();
       })
       .then((un) => {
         unlistenTermClose = un;

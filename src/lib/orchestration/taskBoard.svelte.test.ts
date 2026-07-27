@@ -164,4 +164,36 @@ describe('taskBoard persistence (task group 2)', () => {
     const saves = invokeMock.mock.calls.filter((c) => c[0] === 'coordinator_tasks_save');
     expect(saves.length).toBe(0);
   });
+
+  it('register sets the path (no disk read) so a mutation on a never-loaded project persists', async () => {
+    invokeMock.mockClear();
+    // A project added mid-session: register its path without any `load` / disk read.
+    taskBoard.register('P-registered', '/proj/registered');
+    // register must NOT read from disk (no coordinator_tasks_load call).
+    expect(invokeMock.mock.calls.some((c) => c[0] === 'coordinator_tasks_load')).toBe(false);
+
+    taskBoard.upsert(newTask({ goal: 'r', projectId: 'P-registered', now: 1, id: 'T1' }));
+    vi.runOnlyPendingTimers();
+    const saves = invokeMock.mock.calls.filter((c) => c[0] === 'coordinator_tasks_save');
+    expect(saves.length).toBe(1);
+    expect(saves[0][1]).toMatchObject({ projectPath: '/proj/registered' });
+  });
+
+  it('flushAll immediately issues pending saves and clears timers (no debounce wait)', async () => {
+    invokeMock.mockResolvedValueOnce(null);
+    await taskBoard.load('P-flush', '/proj/flush');
+    invokeMock.mockClear();
+
+    // Mutate, then flush WITHOUT advancing timers — the save must fire synchronously.
+    taskBoard.upsert(newTask({ goal: 'f', projectId: 'P-flush', now: 1, id: 'T1' }));
+    taskBoard.flushAll();
+    const saves = invokeMock.mock.calls.filter((c) => c[0] === 'coordinator_tasks_save');
+    expect(saves.length).toBe(1);
+    expect(saves[0][1]).toMatchObject({ projectPath: '/proj/flush' });
+
+    // The debounce timer was cancelled: running pending timers issues no second save.
+    invokeMock.mockClear();
+    vi.runOnlyPendingTimers();
+    expect(invokeMock.mock.calls.filter((c) => c[0] === 'coordinator_tasks_save').length).toBe(0);
+  });
 });

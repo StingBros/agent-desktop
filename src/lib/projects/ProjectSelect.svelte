@@ -7,6 +7,7 @@
 
   import { onMount } from 'svelte';
   import { projects } from './projects.svelte';
+  import { taskBoard } from '../orchestration/taskBoard.svelte';
   import { projectForId, PROJECT_ICON_CHOICES, hexA } from './projects';
   import { pickFolder } from '../launcher/pick';
   import Icon from '../icons/Icon.svelte';
@@ -144,6 +145,9 @@
       icon: pick.icon,
       color: pick.color
     });
+    // Register the new project's path with the coordinator task board so its
+    // mutations debounce-persist (a mid-session project is never `load`ed at mount).
+    taskBoard.register(stored.id, stored.path);
     onChange(stored.id);
     resetCreate();
     open = false;
