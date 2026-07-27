@@ -17,8 +17,9 @@
 //! Each accepted connection is served on its own thread; the reply for an in-flight
 //! request arrives on a `std::sync::mpsc` channel that the serving thread blocks on
 //! (with a timeout). A small per-target serialization queue ensures two ops aimed
-//! at the SAME agent pane do not interleave, while ops with no target — or aimed at
-//! different targets — proceed concurrently.
+//! at the SAME target — an agent pane (`paneId`), or a Task (`taskId`) for the
+//! worker back-channel ops — do not interleave, while ops with no target, or aimed
+//! at different targets, proceed concurrently.
 //!
 //! Socket-path convention matches the events socket (a basename under the app-data
 //! dir; see `lib.rs`). The path is exported to a launched coordinator session via
@@ -163,9 +164,11 @@ impl PendingRegistry {
     }
 }
 
-/// Per-target serialization queue. Ops targeting ONE agent pane (keyed by the
-/// target pane id) must not interleave: a second op for the same target waits for
-/// the first to finish. Ops with no target are not serialized.
+/// Per-target serialization queue. Ops targeting ONE target — an agent pane
+/// (`paneId`), or a Task (`taskId`) for the worker back-channel ops — must not
+/// interleave: a second op for the same target waits for the first to finish. Ops
+/// with no target are not serialized. See [`target_of`](Self::target_of) for how the
+/// key is chosen.
 ///
 /// Implemented as a set of "busy" targets guarded by a `Condvar`: acquiring a
 /// target blocks while it is busy, then marks it busy and hands back a guard whose
@@ -207,14 +210,25 @@ impl TargetQueues {
         }
     }
 
-    /// Determine the serialization target for a request: the `paneId` string in
-    /// `args` (the agent a `message_agent` / `read_agent` / etc. acts on). Ops with
-    /// no `paneId` (e.g. `list_agents`, `spawn_agent`) return `None` and are not
-    /// serialized against any target.
+    /// Determine the serialization target for a request. A back-channel op
+    /// (`report_progress` / `report_done` / `report_blocked` / `ask_coordinator`)
+    /// carries a `taskId`, and concurrent reports to the SAME Task must not
+    /// interleave — so `taskId`, when present, is the serialization key (D8). Every
+    /// other op (`message_agent` / `read_agent` / etc.) keys on `paneId`, the agent
+    /// it acts on. Ops with neither (e.g. `list_agents`, `spawn_agent`) return `None`
+    /// and are not serialized against any target.
+    ///
+    /// `taskId` wins over `paneId` when both are present (a back-channel op stamps
+    /// both), so two reports for one Task serialize even though they share a pane,
+    /// while reports for different Tasks proceed concurrently.
     pub fn target_of(args: &Value) -> Option<String> {
-        args.get("paneId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+        let field = |key: &str| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        };
+        field("taskId")
+            .or_else(|| field("paneId"))
             .map(|s| s.to_string())
     }
 
@@ -498,7 +512,7 @@ mod tests {
     // ---- TargetQueues serialization (3.4) ----
 
     #[test]
-    fn target_of_reads_pane_id_only() {
+    fn target_of_keys_on_pane_id_for_existing_ops() {
         assert_eq!(
             TargetQueues::target_of(&json!({"paneId": "p1", "text": "x"})),
             Some("p1".to_string())
@@ -506,6 +520,34 @@ mod tests {
         assert_eq!(TargetQueues::target_of(&json!({"prompt": "go"})), None);
         assert_eq!(TargetQueues::target_of(&json!({"paneId": ""})), None);
         assert_eq!(TargetQueues::target_of(&Value::Null), None);
+    }
+
+    /// A back-channel op carries `taskId`, which is the serialization key (D8): when
+    /// present it WINS over `paneId` (a report stamps both), so reports for one Task
+    /// serialize while reports for different Tasks stay independent. Falls back to
+    /// `paneId` when `taskId` is absent/blank.
+    #[test]
+    fn target_of_prefers_task_id_over_pane_id() {
+        // Both present: taskId wins (per-Task serialization).
+        assert_eq!(
+            TargetQueues::target_of(&json!({"taskId": "T3", "paneId": "p1", "note": "x"})),
+            Some("T3".to_string())
+        );
+        // taskId only (e.g. a report whose pane isn't stamped): keyed on taskId.
+        assert_eq!(
+            TargetQueues::target_of(&json!({"taskId": "T7", "result": "done"})),
+            Some("T7".to_string())
+        );
+        // Blank taskId falls back to paneId (never keys on an empty string).
+        assert_eq!(
+            TargetQueues::target_of(&json!({"taskId": "", "paneId": "p2"})),
+            Some("p2".to_string())
+        );
+        // Neither present: not serialized.
+        assert_eq!(
+            TargetQueues::target_of(&json!({"taskId": "", "paneId": ""})),
+            None
+        );
     }
 
     /// Two ops to the SAME target run sequentially: the second cannot start its
@@ -619,6 +661,96 @@ mod tests {
         assert!(one_in.load(Ordering::SeqCst) && two_in.load(Ordering::SeqCst));
     }
 
+    /// D8 end-to-end on the KEY DERIVATION: two back-channel ops for the SAME Task
+    /// (`taskId` derived via `target_of`, as `serve_connection` does) run sequentially
+    /// even though they carry different `paneId`s — the Task is the serialization key.
+    #[test]
+    fn same_task_reports_run_sequentially() {
+        let queues = Arc::new(TargetQueues::new());
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        // Two reports for Task T1, from different panes — must still serialize.
+        let a1 = json!({"taskId": "T1", "paneId": "pA", "note": "step 1"});
+        let a2 = json!({"taskId": "T1", "paneId": "pB", "note": "step 2"});
+        let k1 = TargetQueues::target_of(&a1);
+        let k2 = TargetQueues::target_of(&a2);
+        assert_eq!(k1, Some("T1".to_string()));
+        assert_eq!(k2, Some("T1".to_string()));
+
+        let q1 = queues.clone();
+        let l1 = log.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let s1 = started.clone();
+        let t1 = std::thread::spawn(move || {
+            q1.run_serialized(k1.as_deref(), || {
+                l1.lock().unwrap().push("1-start");
+                s1.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                l1.lock().unwrap().push("1-end");
+            });
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let q2 = queues.clone();
+        let l2 = log.clone();
+        let t2 = std::thread::spawn(move || {
+            q2.run_serialized(k2.as_deref(), || {
+                l2.lock().unwrap().push("2-start");
+                l2.lock().unwrap().push("2-end");
+            });
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["1-start", "1-end", "2-start", "2-end"],
+            "reports for the same Task must not interleave"
+        );
+    }
+
+    /// D8: two back-channel ops for DIFFERENT Tasks run concurrently — the second
+    /// enters its critical section while the first still holds its own Task.
+    #[test]
+    fn different_task_reports_run_concurrently() {
+        let queues = Arc::new(TargetQueues::new());
+        let a_in = Arc::new(AtomicBool::new(false));
+        let b_in = Arc::new(AtomicBool::new(false));
+
+        let ka = TargetQueues::target_of(&json!({"taskId": "Ta", "paneId": "p1"}));
+        let kb = TargetQueues::target_of(&json!({"taskId": "Tb", "paneId": "p1"}));
+        // Same pane, different Tasks: they must NOT block each other (keyed on Task).
+        assert_eq!(ka, Some("Ta".to_string()));
+        assert_eq!(kb, Some("Tb".to_string()));
+
+        let qa = queues.clone();
+        let a_in_c = a_in.clone();
+        let b_in_probe = b_in.clone();
+        let ta = std::thread::spawn(move || {
+            qa.run_serialized(ka.as_deref(), || {
+                a_in_c.store(true, Ordering::SeqCst);
+                let start = Instant::now();
+                while !b_in_probe.load(Ordering::SeqCst) {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(2),
+                        "different Task Tb never ran concurrently"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+        });
+        let qb = queues.clone();
+        let b_in_c = b_in.clone();
+        let tb = std::thread::spawn(move || {
+            qb.run_serialized(kb.as_deref(), || {
+                b_in_c.store(true, Ordering::SeqCst);
+            });
+        });
+        ta.join().unwrap();
+        tb.join().unwrap();
+        assert!(a_in.load(Ordering::SeqCst) && b_in.load(Ordering::SeqCst));
+    }
+
     // ---- Full socket round-trip ----
 
     /// Helper: connect, send one request line, read the one response line back.
@@ -662,6 +794,38 @@ mod tests {
         let resp = round_trip(server.address(), r#"{"op":"list_agents","args":{}}"#);
         assert_eq!(resp["result"], json!({"echo": "list_agents"}));
         assert!(resp["id"].as_u64().unwrap() >= 1, "id assigned");
+        drop(server);
+    }
+
+    /// The transport is op-AGNOSTIC for delivery: a back-channel op it has never seen
+    /// hard-coded (`report_done`, carrying `{taskId, projectId, paneId, ...}`) is
+    /// parsed, assigned an id, emitted, and its reply is written back id-matched —
+    /// exactly like the existing ops. Confirms 4.1/4.2 without any op allow-list.
+    #[test]
+    fn back_channel_op_round_trips_a_reply() {
+        let tmp = TempDir::new("backchannel");
+        let socket = tmp.path().join("c.sock");
+
+        let captured: Arc<Mutex<Option<Arc<PendingRegistry>>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        // Echo the op AND the delivered taskId, proving args are forwarded verbatim.
+        let server = start_control_server(&crate::ipc::socket_address(&socket), move |id, req| {
+            let pending = cap.lock().unwrap().clone().expect("pending wired");
+            let op = req.op.clone();
+            let task = req.args["taskId"].as_str().unwrap_or("").to_string();
+            std::thread::spawn(move || {
+                pending.complete(id, ReplyOutcome::Result(json!({ "op": op, "taskId": task })));
+            });
+        })
+        .unwrap();
+        *captured.lock().unwrap() = Some(server.pending().clone());
+
+        let resp = round_trip(
+            server.address(),
+            r#"{"op":"report_done","args":{"taskId":"T9","projectId":"proj","paneId":"p1","result":"ok"}}"#,
+        );
+        assert_eq!(resp["result"], json!({"op": "report_done", "taskId": "T9"}));
+        assert!(resp["id"].as_u64().unwrap() >= 1, "id assigned to the reply");
         drop(server);
     }
 

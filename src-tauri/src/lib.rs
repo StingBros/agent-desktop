@@ -80,6 +80,14 @@ const EVENT_HOOK_SRC: &str = include_str!("../resources/event-hook.cjs");
 /// `node` shebang. See `resources/orchestration-mcp.cjs`.
 const ORCHESTRATION_MCP_SRC: &str = include_str!("../resources/orchestration-mcp.cjs");
 
+/// The baked BACK-CHANNEL MCP ADAPTER source (installed beside the wrapper). Sibling
+/// of the orchestration adapter, but attached to a launched WORKER session that was
+/// dispatched with a Task (`--mcp-config`); it forwards the worker back-channel ops
+/// (`report_progress` / `report_done` / `report_blocked` / `ask_coordinator`) over
+/// the Rust control socket to the frontend executor. Authored as CommonJS so it runs
+/// standalone under the `node` shebang. See `resources/back-channel-mcp.cjs`.
+const BACK_CHANNEL_MCP_SRC: &str = include_str!("../resources/back-channel-mcp.cjs");
+
 /// Subdir (under app-data) holding the installed wrapper executable.
 const BIN_DIR: &str = "bin";
 /// Installed wrapper basename. Kept as `.js` (the name the spec/`--settings`
@@ -91,6 +99,9 @@ const EVENT_HOOK_FILE: &str = "event-hook.js";
 /// Installed orchestration MCP adapter basename (a standalone `.js`, run via `node`
 /// in the coordinator's `--mcp-config` server).
 const ORCHESTRATION_MCP_FILE: &str = "orchestration-mcp.js";
+/// Installed back-channel MCP adapter basename (a standalone `.js`, run via `node`
+/// in a Task-dispatched worker's `--mcp-config` server).
+const BACK_CHANNEL_MCP_FILE: &str = "back-channel-mcp.js";
 /// Subdir (under app-data) the wrapper writes per-pane snapshots into and the
 /// `SnapshotWatcher` watches.
 const SNAPSHOT_DIR: &str = "snapshots";
@@ -122,6 +133,11 @@ pub struct UsagePaths {
     /// Absolute path to the installed orchestration MCP adapter — `node <this>` is
     /// the coordinator launch's `--mcp-config` server command (`buildMcpToolkitConfig`).
     pub adapter_path: String,
+    /// Absolute path to the installed BACK-CHANNEL MCP adapter — `node <this>` is the
+    /// `--mcp-config` server command for a Task-dispatched WORKER (attached only when
+    /// a worker is launched with a Task; see the worker dispatch wiring). Sibling of
+    /// `adapter_path`, sharing the same control socket (`control_socket_path`).
+    pub back_channel_adapter_path: String,
     /// ADDRESS of the Rust orchestration CONTROL socket (sibling of
     /// `socket_path`, same path-vs-pipe-name rule) — goes into the coordinator's
     /// `--mcp-config` server env as `AGENT_DESKTOP_CONTROL_SOCKET` so the adapter
@@ -1056,6 +1072,8 @@ pub fn install_usage_assets_in(base: &std::path::Path) -> Result<UsagePaths, Str
     let wrapper = install_executable(&bin, WRAPPER_FILE, STATUSLINE_WRAPPER_SRC)?;
     let event_hook = install_executable(&bin, EVENT_HOOK_FILE, EVENT_HOOK_SRC)?;
     let adapter = install_executable(&bin, ORCHESTRATION_MCP_FILE, ORCHESTRATION_MCP_SRC)?;
+    let back_channel_adapter =
+        install_executable(&bin, BACK_CHANNEL_MCP_FILE, BACK_CHANNEL_MCP_SRC)?;
 
     let snapshots = base.join(SNAPSHOT_DIR);
     fs::create_dir_all(&snapshots).map_err(|e| format!("create_dir_all {snapshots:?}: {e}"))?;
@@ -1076,6 +1094,7 @@ pub fn install_usage_assets_in(base: &std::path::Path) -> Result<UsagePaths, Str
         // `start_event_server` / `start_control_server` bind, and unchanged on Unix.
         socket_path: crate::ipc::events_address(base),
         adapter_path: adapter.to_string_lossy().into_owned(),
+        back_channel_adapter_path: back_channel_adapter.to_string_lossy().into_owned(),
         control_socket_path: crate::ipc::control_address(base),
     })
 }
@@ -2027,6 +2046,27 @@ mod tests {
         );
         // The two sockets must never resolve to the same address on any platform.
         assert_ne!(paths.socket_path, paths.control_socket_path);
+
+        // The back-channel MCP adapter is installed beside the orchestration adapter
+        // (same baked source + shebang + 0755 contract) so a Task-dispatched worker's
+        // --mcp-config can reference it. It shares the same control socket.
+        let back_channel = PathBuf::from(&paths.back_channel_adapter_path);
+        assert_eq!(
+            back_channel,
+            tmp.path().join(BIN_DIR).join(BACK_CHANNEL_MCP_FILE)
+        );
+        assert!(back_channel.is_file(), "back-channel adapter must exist");
+        let back_channel_src = fs::read_to_string(&back_channel).unwrap();
+        assert_eq!(back_channel_src, BACK_CHANNEL_MCP_SRC);
+        assert!(back_channel_src.starts_with("#!/usr/bin/env node"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&back_channel).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "back-channel adapter must be mode 0755");
+        }
+        // Distinct from the orchestration adapter (different file, same dir).
+        assert_ne!(paths.adapter_path, paths.back_channel_adapter_path);
     }
 
     /// THE invariant the Windows port hinges on: the address a session is told to
