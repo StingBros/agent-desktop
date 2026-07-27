@@ -680,6 +680,141 @@ describe('OrchestrationExecutor — back-channel reports (tasks 5.1–5.4)', () 
   });
 });
 
+describe('OrchestrationExecutor — push-when-idle coordinator notification (task group 8)', () => {
+  // Distinct projectId per test (the board singleton has no clear()), mirroring the
+  // back-channel block.
+  let n = 0;
+  const freshProject = () => `notify-proj-${++n}`;
+  function seedTask(projectId: string, over: Partial<Task> = {}): Task {
+    const t: Task = { ...newTask({ goal: 'g', projectId, now: 1000 }), ...over };
+    taskBoard.upsert(t);
+    return t;
+  }
+  /** Deps with a LIVE, IDLE coordinator pane wired for `projectPath('/repo')`. */
+  function idleCoordDeps(over: Partial<ExecutorDeps> = {}) {
+    return makeDeps({
+      projectPath: () => '/repo',
+      coordinatorFor: () => 'coord',
+      locate: (id) => (id === 'coord' ? (pane('coord', { role: 'coordinator' }) as any) : null),
+      statusOf: () => 'waiting', // idle → accepts the push
+      ...over
+    });
+  }
+
+  beforeEach(() => resetTaskIds());
+
+  it('injects a DONE line into an idle coordinator', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { deps, sent } = idleCoordDeps();
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: 'all green' }
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].paneId).toBe('coord');
+    expect(sent[0].text).toContain(t.id);
+    expect(sent[0].text).toContain('DONE');
+    expect(sent[0].text).toContain('all green');
+  });
+
+  it('injects a BLOCKED line into an idle coordinator', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { deps, sent } = idleCoordDeps();
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({
+      id: 1,
+      op: 'report_blocked',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', reason: 'needs API key' }
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].paneId).toBe('coord');
+    expect(sent[0].text).toContain(t.id);
+    expect(sent[0].text).toContain('BLOCKED');
+    expect(sent[0].text).toContain('needs API key');
+  });
+
+  it('injects a QUESTION line into an idle coordinator', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { deps, sent } = idleCoordDeps();
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({
+      id: 1,
+      op: 'ask_coordinator',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', question: 'which db?' }
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].paneId).toBe('coord');
+    expect(sent[0].text).toContain(t.id);
+    expect(sent[0].text).toContain('QUESTION');
+    expect(sent[0].text).toContain('which db?');
+  });
+
+  it('busy coordinator → injection skipped, no throw, Task state still applied (board authoritative)', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { deps, sent, replies } = idleCoordDeps({ statusOf: () => 'working' });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: 'done' }
+    });
+    expect(sent).toEqual([]); // deferred — coordinator is mid-turn
+    expect(taskBoard.getTask(proj, t.id)!.state).toBe('done'); // board still updated
+    expect(replies[0].outcome.result).toMatchObject({ ok: true, state: 'done' });
+  });
+
+  it('coordinator sitting on a live question menu → injection skipped (no garble)', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { deps, sent } = idleCoordDeps({
+      readActivity: () => ({ summary: null, messages: [], question: 'Pick one?', contextPct: null })
+    });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({
+      id: 1,
+      op: 'report_blocked',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', reason: 'x' }
+    });
+    expect(sent).toEqual([]);
+    expect(taskBoard.getTask(proj, t.id)!.state).toBe('blocked');
+  });
+
+  it('no coordinator pane → no throw, no injection, Task state still applied', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { deps, sent, replies } = idleCoordDeps({ coordinatorFor: () => null });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: 'ok' }
+    });
+    expect(sent).toEqual([]);
+    expect(taskBoard.getTask(proj, t.id)!.state).toBe('done');
+    expect(replies[0].outcome.error).toBeUndefined();
+  });
+
+  it('report_progress does NOT inject (progress is board-only) even with an idle coordinator', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { deps, sent } = idleCoordDeps();
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({
+      id: 1,
+      op: 'report_progress',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', note: 'halfway' }
+    });
+    expect(sent).toEqual([]);
+    expect(taskBoard.getTask(proj, t.id)!.state).toBe('working');
+  });
+});
+
 describe('OrchestrationExecutor — coordinator task tools & spawn goal (tasks 6.1-6.3)', () => {
   // Distinct projectId per test — the board singleton has no clear() (mirrors the
   // back-channel block).

@@ -815,16 +815,41 @@ export class OrchestrationExecutor {
   }
 
   /**
-   * TODO(group 8): push-when-idle coordinator notification. On a report warranting
-   * action (`done`/`blocked`/`ask`) this will inject a compact structured line into
-   * the project coordinator's pane when it is idle (reusing the idle-gated
-   * `message_agent` path), deferring when busy — the board stays the durable record
-   * (design D5 / spec "Reports push to the coordinator when it is idle"). Until group
-   * 8 wires that, this is a no-op stub (it only logs) so groups 5 and 8 do not
-   * collide on this file. Deliberately NOT called for `report_progress`.
+   * PUSH-WHEN-IDLE coordinator notification (task group 8; design D5 / spec "Reports
+   * push to the coordinator when it is idle"). On a report warranting action
+   * (`done`/`blocked`/`ask`) inject a compact structured line into the project
+   * coordinator's pane, reusing the SAME idle gate `message_agent` uses (skip a
+   * mid-turn/`working` target; refuse a target sitting on a live AskUserQuestion menu
+   * so free text never garbles it).
+   *
+   * BEST-EFFORT, unlike `message_agent`: this never blocks and never errors. When the
+   * project has no live coordinator pane, or the coordinator is busy / can't cleanly
+   * accept input right now, the injection is simply SKIPPED — the Task board is the
+   * durable record and the coordinator reconciles via `list_tasks`/`get_task` on its
+   * next turn (spec "Busy coordinator relies on the durable board"; the Task state
+   * change is already applied by the caller and is never lost by a dropped push). Any
+   * unexpected error is swallowed so a notification failure can never fail the report.
+   *
+   * Deliberately NOT called for `report_progress` (progress is board-only, no push).
    */
   private notifyCoordinator(task: Task, kind: 'done' | 'blocked' | 'ask'): void {
-    console.debug(`[task ${task.id}] notifyCoordinator(${kind}) — stub (wired in group 8)`);
+    try {
+      // Locate the project's LIVE coordinator pane. No coordinator → nothing to notify.
+      const coordPaneId = this.deps.coordinatorFor(task.projectId);
+      if (!coordPaneId) return;
+      const located = this.deps.locate(coordPaneId);
+      if (!located || located.session.closed === true) return;
+      // Idle gate (mirrors message_agent, best-effort): a coordinator sitting on a live
+      // AskUserQuestion/permission menu must not receive free text (it would select a
+      // garbage option), and a mid-turn (`working`) coordinator can't cleanly accept
+      // input — defer in both cases (the board carries the change).
+      if (this.deps.readActivity(coordPaneId).question != null) return;
+      if (this.deps.statusOf(coordPaneId) === 'working') return;
+      this.deps.sendToPane(coordPaneId, coordinatorNotice(task, kind));
+    } catch (err) {
+      // Never let a notification failure escape into the report handler.
+      console.debug(`[task ${task.id}] notifyCoordinator(${kind}) skipped:`, err);
+    }
   }
 
   /** Build the `AgentInfo` for a located pane. */
@@ -852,6 +877,39 @@ const RESULT_SUMMARY_PREVIEW = 200;
 function summarizeResult(result: string, relPath: string): string {
   const preview = result.slice(0, RESULT_SUMMARY_PREVIEW).trim();
   return `${preview}… (full result stored at ${relPath})`;
+}
+
+/** Max chars of the free-text tail (result/reason/question) kept in a coordinator
+ *  push line — the push is a terse nudge; the full detail lives on the Task board. */
+const COORD_NOTICE_MAX = 200;
+
+/** Collapse newlines/runs of whitespace to single spaces, trim, and truncate to
+ *  `max` (with an ellipsis) so a pushed line stays compact and single-line. */
+function compactOneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max).trimEnd()}…` : flat;
+}
+
+/**
+ * Build the compact, single-line coordinator push for a report (task group 8):
+ *   done    → `[task <id>] <specialist|worker> reported DONE — result: <resultRefOrSummary>`
+ *   blocked → `[task <id>] BLOCKED — <reason>`
+ *   ask     → `[task <id>] QUESTION — <question>`
+ * The free-text tail is flattened + truncated (see {@link compactOneLine}); the board
+ * holds the full detail. Pure: depends only on its inputs.
+ */
+function coordinatorNotice(task: Task, kind: 'done' | 'blocked' | 'ask'): string {
+  switch (kind) {
+    case 'done': {
+      const who = task.specialist ?? 'worker';
+      const result = compactOneLine(task.result ?? '', COORD_NOTICE_MAX) || '(no result)';
+      return `[task ${task.id}] ${who} reported DONE — result: ${result}`;
+    }
+    case 'blocked':
+      return `[task ${task.id}] BLOCKED — ${compactOneLine(task.blockedReason ?? '', COORD_NOTICE_MAX)}`;
+    case 'ask':
+      return `[task ${task.id}] QUESTION — ${compactOneLine(task.question ?? '', COORD_NOTICE_MAX)}`;
+  }
 }
 
 /** Coerce an unknown args value into a plain object (null/non-object → {}). */

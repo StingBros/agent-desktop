@@ -22,6 +22,7 @@
   import { noteOutput, noteExit, noteBusy, noteResize, clearRuntime } from './overview/runtime';
   import { detectTerminalBusy } from './overview/terminalBusy';
   import { events } from './overview/events.svelte';
+  import { executor } from './orchestration/executor.svelte';
 
   // PtyEvent — the exact wire shape the Rust backend streams over the per-pane
   // Channel (internally tagged on `event`):
@@ -597,6 +598,12 @@
           exited = true;
           // Record the exit for the overview status (finished vs errored, by code).
           noteExit(paneId, msg.code);
+          // LOST-ASSIGNEE RECONCILIATION (task group 5 wiring): a dying worker fails
+          // any non-terminal Task assigned to it (never completes it — completion is
+          // report_done only). Called here, while the pane is still registered, so the
+          // executor (the single Task writer) can resolve the pane's project via
+          // `locate`. Idempotent + best-effort for panes with no assigned Task.
+          executor.reconcileOnPaneExit(paneId);
           // Clear the backend pane id so input/paste/send (and the registered
           // `send` handle) all treat this pane as dead: nothing is written to a
           // PTY that no longer exists, and `send` reports false rather than a

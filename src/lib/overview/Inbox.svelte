@@ -32,7 +32,8 @@
     orderRowsByLane,
     type AgentLane,
     type AgentRow,
-    type AgentStatus
+    type AgentStatus,
+    type TaskMap
   } from './roster';
   import {
     isAttention,
@@ -67,6 +68,7 @@
     type WorkflowGroup
   } from './subagentRows';
   import { projects } from '$lib/projects/projects.svelte';
+  import { taskBoard } from '$lib/orchestration/taskBoard.svelte';
   import { projectFilter } from '$lib/projects/projectFilter.svelte';
   import {
     filterRowsByProject,
@@ -147,6 +149,20 @@
   // (tasks 10.11–10.12). A coordinator in this set surfaces "needs you" even with no
   // pending AskUserQuestion; the default keep-working heuristic never flags it.
   const coordNeedsInputSet = $derived(new Set(Object.keys(coordinatorNeedsInput.all())));
+  // Coordinator-task attribution (task 10.1 wiring): group every loaded project's Tasks
+  // by their assignee pane so each worker row shows the Task it is executing. Fully
+  // derived from the reactive `taskBoard` (+ projects list) — no new polling. A pane
+  // with no assigned Task is simply absent from the map (its row's task fields stay null).
+  const tasksByPane = $derived.by(() => {
+    const map: TaskMap = {};
+    for (const p of projects.list) {
+      for (const t of taskBoard.listTasks(p.id)) {
+        if (!t.assigneePaneId) continue;
+        (map[t.assigneePaneId] ??= []).push(t);
+      }
+    }
+    return map;
+  });
   const allRows = $derived(
     buildRoster(
       snapshots.byPane,
@@ -156,7 +172,8 @@
       activity.bySession,
       undefined,
       events.activityMap(),
-      coordNeedsInputSet
+      coordNeedsInputSet,
+      tasksByPane
     )
   );
 
