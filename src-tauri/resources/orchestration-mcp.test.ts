@@ -86,13 +86,16 @@ describe('orchestration-mcp pure core', () => {
     expect(input).toEqual({ paneId: 'p1' });
   });
 
-  it('exposes the toolkit tools (incl. request_user_input) with arg schemas', () => {
+  it('exposes the toolkit tools (incl. request_user_input + task tools) with arg schemas', () => {
     const names = mcp.TOOLS.map((t) => t.name).sort();
     expect(names).toEqual(
       [
         'archive_agent',
+        'assign_task',
+        'get_task',
         'inspect_agent',
         'list_agents',
+        'list_tasks',
         'message_agent',
         'read_agent',
         'request_user_input',
@@ -106,6 +109,46 @@ describe('orchestration-mcp pure core', () => {
     for (const t of mcp.TOOLS) {
       expect(t.inputSchema.type).toBe('object');
     }
+  });
+
+  it('exposes the coordinator task tools with their arg schemas', () => {
+    const assign = mcp.TOOLS.find((t) => t.name === 'assign_task');
+    expect(assign).toBeDefined();
+    expect(assign!.inputSchema.properties).toHaveProperty('goal');
+    expect(assign!.inputSchema.properties).toHaveProperty('specialist');
+    // goal is required; specialist is optional.
+    expect(assign!.inputSchema.required ?? []).toContain('goal');
+    expect(assign!.inputSchema.required ?? []).not.toContain('specialist');
+
+    const list = mcp.TOOLS.find((t) => t.name === 'list_tasks');
+    expect(list).toBeDefined();
+    expect(list!.inputSchema.properties).toHaveProperty('state');
+    // state is an optional filter.
+    expect(list!.inputSchema.required ?? []).not.toContain('state');
+
+    const get = mcp.TOOLS.find((t) => t.name === 'get_task');
+    expect(get).toBeDefined();
+    expect(get!.inputSchema.properties).toHaveProperty('id');
+    expect(get!.inputSchema.required ?? []).toContain('id');
+  });
+
+  it('spawn_agent advertises an optional goal (Task shortcut) alongside prompt', () => {
+    const spawn = mcp.TOOLS.find((t) => t.name === 'spawn_agent');
+    expect(spawn).toBeDefined();
+    expect(spawn!.inputSchema.properties).toHaveProperty('goal');
+    // prompt stays required; goal is optional (no-goal spawn is unchanged).
+    expect(spawn!.inputSchema.required ?? []).toContain('prompt');
+    expect(spawn!.inputSchema.required ?? []).not.toContain('goal');
+  });
+
+  it('stamps the coordinator projectId into a task-tool call and encodes it verbatim', () => {
+    // assign_task forwards { goal, specialist } + the merged projectId as one {op,args} line.
+    const scoped = mcp.mergeProjectId({ goal: 'ship it', specialist: 'reviewer' }, 'proj-A');
+    const line = mcp.encodeRequest('assign_task', scoped);
+    expect(JSON.parse(line)).toEqual({
+      op: 'assign_task',
+      args: { goal: 'ship it', specialist: 'reviewer', projectId: 'proj-A' }
+    });
   });
 
   it('exposes request_user_input with an optional message arg', () => {

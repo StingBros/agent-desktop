@@ -63,6 +63,15 @@ function makeDeps(over: Partial<ExecutorDeps> = {}) {
       return 'pane-new';
     },
     coordinatorFor: () => null,
+    usagePaths: async () => ({
+      wrapperPath: '/install/statusline-wrapper.js',
+      snapshotDir: '/install/snapshots',
+      eventHookPath: '/install/event-hook.js',
+      socketPath: '/install/event.sock',
+      adapterPath: '/install/orchestration-mcp.cjs',
+      backChannelAdapterPath: '/install/back-channel-mcp.cjs',
+      controlSocketPath: '/install/control.sock'
+    }),
     archive: (paneId) => archived.push(paneId),
     unarchive: (paneId) => unarchived.push(paneId),
     schedule: (run) => run(), // run synchronously for deterministic tests
@@ -73,7 +82,8 @@ function makeDeps(over: Partial<ExecutorDeps> = {}) {
     // (existing tests create no Tasks, so getTask→null / listTasks→[] leave them
     // untouched). Report tests seed the board and assert via `taskBoard.getTask`.
     getTask: (projectId, taskId) => taskBoard.getTask(projectId, taskId),
-    listTasks: (projectId) => taskBoard.listTasks(projectId),
+    listTasks: (projectId, state) => taskBoard.listTasks(projectId, state),
+    upsertTask: (task) => taskBoard.upsert(task),
     addNote: (projectId, taskId, text, ts) => taskBoard.addNote(projectId, taskId, text, ts),
     transitionTask: (projectId, taskId, to, patch) =>
       taskBoard.transition(projectId, taskId, to, patch),
@@ -667,5 +677,168 @@ describe('OrchestrationExecutor — back-channel reports (tasks 5.1–5.4)', () 
     expect(after.notes.map((n) => n.text)).toEqual(['A', 'B']); // ordered
     expect(after.state).toBe('done');
     expect(after.result).toBe('fin');
+  });
+});
+
+describe('OrchestrationExecutor — coordinator task tools & spawn goal (tasks 6.1-6.3)', () => {
+  // Distinct projectId per test — the board singleton has no clear() (mirrors the
+  // back-channel block).
+  let n = 0;
+  const proj = () => `task-proj-${++n}`;
+  /** Pull the JSON blob that follows `--mcp-config` in a launch plan's extraArgs. */
+  function mcpConfigArg(extra: string[] | undefined): string | undefined {
+    if (!extra) return undefined;
+    const i = extra.indexOf('--mcp-config');
+    return i >= 0 ? extra[i + 1] : undefined;
+  }
+
+  it('assign_task creates+binds a Task and dispatches a back-channel worker', async () => {
+    const p = proj();
+    const { deps, replies, launched } = makeDeps({ projectPath: (id) => (id === p ? '/repo' : null) });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'assign_task', args: { projectId: p, goal: 'ship the thing' } });
+
+    const result = replies[0].outcome.result;
+    expect(result.paneId).toBe('pane-new');
+    expect(result.taskId).toMatch(/^T\d+$/);
+
+    // The Task is on the board, bound to the launched pane, carrying the goal.
+    const task = taskBoard.getTask(p, result.taskId)!;
+    expect(task).toBeTruthy();
+    expect(task.goal).toBe('ship the thing');
+    expect(task.assigneePaneId).toBe('pane-new');
+    expect(task.projectId).toBe(p);
+
+    // Dispatched with the back-channel: the plan carries the Task id, and extraArgs
+    // carry a --mcp-config whose JSON references the back-channel adapter + this Task id.
+    const plan = launched[0];
+    expect(plan.taskId).toBe(result.taskId);
+    expect(plan.initialInput).toBe('ship the thing'); // assign_task: goal is the input
+    const cfg = mcpConfigArg(plan.extraArgs);
+    expect(cfg).toBeDefined();
+    expect(cfg).toContain('back-channel-mcp.cjs');
+    expect(cfg).toContain(result.taskId); // AGENT_DESKTOP_TASK_ID stamped
+    expect(plan.extraArgs).toContain('--append-system-prompt'); // prompt contract
+  });
+
+  it('assign_task with a specialist composes the worker from that specialist', async () => {
+    const p = proj();
+    const { deps, replies, launched } = makeDeps({
+      projectPath: (id) => (id === p ? '/repo' : null),
+      loadSpecialist: async () =>
+        ({ name: 'reviewer', description: 'd', prompt: 'You review.', model: 'claude-sonnet-4-6', tools: ['Read'] }) as Specialist
+    });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'assign_task', args: { projectId: p, goal: 'review it', specialist: 'reviewer' } });
+
+    const result = replies[0].outcome.result;
+    // Specialist recorded on the pane AND the Task.
+    expect(launched[0].specialist).toBe('reviewer');
+    expect(taskBoard.getTask(p, result.taskId)!.specialist).toBe('reviewer');
+    // Specialist model/tools compose into extraArgs, and the system prompt carries BOTH
+    // the specialist body and the Task contract.
+    const extra: string[] = launched[0].extraArgs;
+    expect(extra).toContain('--model');
+    expect(extra).toContain('claude-sonnet-4-6');
+    expect(extra).toContain('--allowedTools');
+    const sp = extra[extra.indexOf('--append-system-prompt') + 1];
+    expect(sp).toContain('You review.');
+    expect(sp).toContain(result.taskId);
+  });
+
+  it('assign_task errors (no Task, no launch) when the specialist cannot be loaded', async () => {
+    const p = proj();
+    const { deps, replies, launched } = makeDeps({
+      projectPath: (id) => (id === p ? '/repo' : null),
+      loadSpecialist: async () => {
+        throw new Error('not found');
+      }
+    });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'assign_task', args: { projectId: p, goal: 'x', specialist: 'ghost' } });
+    expect(launched).toEqual([]);
+    expect(replies[0].outcome.error).toMatch(/could not load specialist/);
+    expect(taskBoard.listTasks(p)).toEqual([]); // no orphan Task
+  });
+
+  it('assign_task rejects a missing goal / missing projectId (no launch)', async () => {
+    const p = proj();
+    const { deps, replies, launched } = makeDeps({ projectPath: (id) => (id === p ? '/repo' : null) });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'assign_task', args: { projectId: p } });
+    expect(replies[0].outcome.error).toMatch(/goal/);
+    await ex.onRequest({ id: 2, op: 'assign_task', args: { goal: 'x' } });
+    expect(replies[1].outcome.error).toMatch(/projectId/);
+    expect(launched).toEqual([]);
+  });
+
+  it('list_tasks is project-scoped and filters by state', async () => {
+    const home = proj();
+    const other = proj();
+    const a = newTask({ goal: 'a', projectId: home, now: 1 });
+    const b = { ...newTask({ goal: 'b', projectId: home, now: 2 }), state: 'done' as const };
+    const c = newTask({ goal: 'c', projectId: other, now: 3 });
+    taskBoard.upsert(a);
+    taskBoard.upsert(b);
+    taskBoard.upsert(c);
+
+    const { deps, replies } = makeDeps();
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'list_tasks', args: { projectId: home } });
+    const all = replies[0].outcome.result.tasks as Task[];
+    expect(all.map((t) => t.id).sort()).toEqual([a.id, b.id].sort());
+    expect(all.map((t) => t.id)).not.toContain(c.id); // other project excluded
+
+    await ex.onRequest({ id: 2, op: 'list_tasks', args: { projectId: home, state: 'done' } });
+    expect((replies[1].outcome.result.tasks as Task[]).map((t) => t.id)).toEqual([b.id]);
+  });
+
+  it('get_task returns an in-project Task and errors for one in another project', async () => {
+    const home = proj();
+    const other = proj();
+    const t = newTask({ goal: 'g', projectId: home, now: 1 });
+    taskBoard.upsert(t);
+    const { deps, replies } = makeDeps();
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'get_task', args: { projectId: home, id: t.id } });
+    expect(replies[0].outcome.result.id).toBe(t.id);
+    // Same id, wrong project → structured error (project scoping).
+    await ex.onRequest({ id: 2, op: 'get_task', args: { projectId: other, id: t.id } });
+    expect(replies[1].outcome.error).toMatch(/no such task/);
+  });
+
+  it('spawn_agent(goal) shortcut creates a Task and dispatches the back-channel worker', async () => {
+    const p = proj();
+    const { deps, replies, launched } = makeDeps({ projectPath: (id) => (id === p ? '/repo' : null) });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'spawn_agent', args: { projectId: p, prompt: 'go build', goal: 'build feature' } });
+
+    const result = replies[0].outcome.result;
+    expect(result.paneId).toBe('pane-new');
+    expect(result.taskId).toMatch(/^T\d+$/);
+    // The Task carries the goal (distinct from the pane's initial input = prompt).
+    const task = taskBoard.getTask(p, result.taskId)!;
+    expect(task.goal).toBe('build feature');
+    expect(task.assigneePaneId).toBe('pane-new');
+    // Back-channel dispatch: plan carries the Task id + prompt as initial input.
+    const plan = launched[0];
+    expect(plan.initialInput).toBe('go build');
+    expect(plan.taskId).toBe(result.taskId);
+    expect(mcpConfigArg(plan.extraArgs)).toContain(result.taskId);
+  });
+
+  it('spawn_agent WITHOUT a goal is unchanged: no Task, no back-channel args', async () => {
+    const p = proj();
+    const { deps, replies, launched } = makeDeps({ projectPath: (id) => (id === p ? '/repo' : null) });
+    const ex = new OrchestrationExecutor(deps);
+    await ex.onRequest({ id: 1, op: 'spawn_agent', args: { projectId: p, prompt: 'just run' } });
+    // Exact legacy return shape.
+    expect(replies[0].outcome.result).toEqual({ paneId: 'pane-new', specialist: null });
+    // No Task created for this project.
+    expect(taskBoard.listTasks(p)).toEqual([]);
+    // No back-channel wiring on the plan.
+    const plan = launched[0];
+    expect(plan.taskId).toBeUndefined();
+    expect(mcpConfigArg(plan.extraArgs)).toBeUndefined();
   });
 });

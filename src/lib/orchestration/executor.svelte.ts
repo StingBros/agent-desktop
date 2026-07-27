@@ -41,13 +41,16 @@ import { projects } from '../projects/projects.svelte';
 import { projectForId } from '../projects/projects';
 import { specialists } from '../specialists/specialists.svelte';
 import { parseSpecialist } from '../specialists/specialists';
-import { specialistLaunchArgs } from './launchArgs';
+import { specialistLaunchArgs, taskWorkerLaunchArgs } from './launchArgs';
 import { buildLaunchPlan } from '../launcher/plan';
+import { buildBackChannelMcpConfig, type UsagePaths } from '../usage/spawn';
+import { getUsagePaths } from '../usage/paths';
 import { findCoordinatorPane, type CoordinatorPaneView } from './coordinator';
 import { coordinatorNeedsInput } from './coordinatorNeedsInput.svelte';
 import { taskBoard } from './taskBoard.svelte';
 import {
   needsArtifact,
+  newTask,
   RESULT_INLINE_MAX,
   TERMINAL_STATES,
   type Task,
@@ -123,6 +126,10 @@ export interface ExecutorDeps {
   /** The paneId of the project's live coordinator, or null — so a coordinator-driven
    *  spawn is attributed to it in the roster/overview (task 6.5). */
   coordinatorFor: (projectId: string) => string | null;
+  /** Resolve the installed usage/adapter paths (the memoized `usage_paths` round-trip
+   *  every claude pane uses) — needed to attach the back-channel MCP to a Task-dispatched
+   *  worker (`backChannelAdapterPath` + `controlSocketPath`). Null when unavailable. */
+  usagePaths: () => Promise<UsagePaths | null>;
   /** Archive (close) / unarchive (restore) a pane. */
   archive: (paneId: string) => void;
   unarchive: (paneId: string) => void;
@@ -142,8 +149,12 @@ export interface ExecutorDeps {
   // shared `taskBoard` store so the handlers stay unit-testable with fakes.
   /** A single Task by id within a project, or null when absent (scope check). */
   getTask: (projectId: string, taskId: string) => Task | null;
-  /** Every Task in a project (used by lost-assignee reconciliation). */
-  listTasks: (projectId: string) => Task[];
+  /** Every Task in a project (used by lost-assignee reconciliation), optionally filtered
+   *  to a single `state` (the `list_tasks` tool). */
+  listTasks: (projectId: string, state?: TaskState) => Task[];
+  /** Insert or replace a Task on the board (the create-or-bind entry point for
+   *  `assign_task` / `spawn_agent(goal)`; single-writer, persisted). */
+  upsertTask: (task: Task) => void;
   /** Append a timestamped progress note to a Task (`report_progress`). */
   addNote: (projectId: string, taskId: string, text: string, ts: number) => Task;
   /** Transition a Task to `to`, applying `patch`; throws on an illegal edge/unknown id. */
@@ -225,6 +236,13 @@ export class OrchestrationExecutor {
         return this.unarchiveAgent(args);
       case 'request_user_input':
         return this.requestUserInput(args);
+      // ── Coordinator task tools (task group 6) ────────────────────────────────
+      case 'assign_task':
+        return this.assignTask(args);
+      case 'list_tasks':
+        return this.listTasksOp(args);
+      case 'get_task':
+        return this.getTaskOp(args);
       // ── Worker back-channel reports (task group 5) ───────────────────────────
       case 'report_progress':
         return this.reportProgress(args);
@@ -275,11 +293,17 @@ export class OrchestrationExecutor {
   // ── Op handlers ────────────────────────────────────────────────────────────
 
   /**
-   * `spawn_agent({ prompt, specialist?, cwd?, projectId })`: launch a new claude
+   * `spawn_agent({ prompt, specialist?, cwd?, goal?, projectId })`: launch a new claude
    * pane in the orchestrator's project with `prompt` as initial input. With a
    * specialist, compose the launch from `.claude/agents/<specialist>.md` (system
-   * prompt + model + tools) and record the specialist on the pane. Returns the new
-   * pane's id.
+   * prompt + model + tools) and record the specialist on the pane.
+   *
+   * When a `goal` is present (task 6.2), this is the assign-a-Task SHORTCUT: a Task is
+   * created for the goal, bound to the launched pane as its assignee, and the worker is
+   * dispatched Task-bound (back-channel MCP + Task id stamped + prompt contract) via the
+   * same seam as `assign_task`; it returns `{ paneId, taskId }`. When `goal` is ABSENT
+   * the behaviour is exactly as before: launch the pane (no Task, no back-channel) and
+   * return `{ paneId, specialist }`.
    */
   private async spawnAgent(args: Record<string, unknown>): Promise<OpResult> {
     const projectId = this.orchestratorProject(args);
@@ -293,6 +317,23 @@ export class OrchestrationExecutor {
       typeof args.specialist === 'string' && args.specialist.trim() !== ''
         ? args.specialist.trim()
         : undefined;
+
+    // Task shortcut: when a `goal` is given, create+assign a Task and dispatch the
+    // worker Task-bound. The pane's initial input stays `prompt`; the Task carries `goal`.
+    const goal =
+      typeof args.goal === 'string' && args.goal.trim() !== '' ? args.goal.trim() : undefined;
+    if (goal) {
+      const dispatched = await this.dispatchTaskWorker({
+        projectId,
+        projPath,
+        goal,
+        prompt,
+        cwd: cwdArg,
+        specialistName
+      });
+      if ('error' in dispatched) return dispatched;
+      return { result: { paneId: dispatched.paneId, taskId: dispatched.taskId } };
+    }
 
     let extraArgs: string[] | undefined;
     if (specialistName) {
@@ -320,6 +361,144 @@ export class OrchestrationExecutor {
     });
     if (!paneId) return { error: 'failed to launch agent' };
     return { result: { paneId, specialist: specialistName ?? null } };
+  }
+
+  // ── Coordinator task tools (task group 6) ──────────────────────────────────
+  //
+  // A Task is the first-class unit of coordination (design D1/D4), DISTINCT from the
+  // pane that runs it. `assign_task` and the `spawn_agent(goal)` shortcut both funnel
+  // through `dispatchTaskWorker` — the single seam that creates a Task, dispatches a
+  // Task-bound worker (back-channel MCP + Task id stamped + prompt contract), and binds
+  // the Task to that pane. `list_tasks`/`get_task` are project-scoped board reads so the
+  // coordinator can plan off the board.
+
+  /**
+   * `assign_task({ goal, specialist?, projectId })`: create a Task for `goal`, spawn a
+   * worker (composed from the specialist when given), bind the Task to that worker as its
+   * assignee, dispatch it with the back-channel toolset + Task id, and return
+   * `{ taskId, paneId }`. The worker's initial input IS the goal (no separate prompt).
+   */
+  private async assignTask(args: Record<string, unknown>): Promise<OpResult> {
+    const projectId = this.orchestratorProject(args);
+    if (!projectId) return { error: 'missing orchestrator projectId in args (scope required)' };
+    const projPath = this.deps.projectPath(projectId);
+    if (!projPath) return { error: `unknown project: ${projectId}` };
+    const goal = typeof args.goal === 'string' && args.goal.trim() !== '' ? args.goal.trim() : '';
+    if (!goal) return { error: 'missing goal' };
+    const specialistName =
+      typeof args.specialist === 'string' && args.specialist.trim() !== ''
+        ? args.specialist.trim()
+        : undefined;
+
+    const dispatched = await this.dispatchTaskWorker({
+      projectId,
+      projPath,
+      goal,
+      // assign_task has no separate prompt — the goal IS the worker's initial input.
+      prompt: goal,
+      cwd: projPath,
+      specialistName
+    });
+    if ('error' in dispatched) return dispatched;
+    return { result: { taskId: dispatched.taskId, paneId: dispatched.paneId } };
+  }
+
+  /**
+   * `list_tasks({ state?, projectId })`: the project's Tasks (optionally filtered by
+   * `state`), so the coordinator can plan off the board. Project-scoped.
+   */
+  private listTasksOp(args: Record<string, unknown>): OpResult {
+    const projectId = this.orchestratorProject(args);
+    if (!projectId) return { error: 'missing orchestrator projectId in args (scope required)' };
+    const state =
+      typeof args.state === 'string' && args.state.trim() !== ''
+        ? (args.state.trim() as TaskState)
+        : undefined;
+    return { result: { tasks: this.deps.listTasks(projectId, state) } };
+  }
+
+  /**
+   * `get_task({ id, projectId })`: a single Task's details, or a structured error when
+   * absent (a Task in another project resolves to null here — project-scoped `getTask`).
+   */
+  private getTaskOp(args: Record<string, unknown>): OpResult {
+    const projectId = this.orchestratorProject(args);
+    if (!projectId) return { error: 'missing orchestrator projectId in args (scope required)' };
+    const id = typeof args.id === 'string' && args.id.trim() !== '' ? args.id.trim() : '';
+    if (!id) return { error: 'missing task id' };
+    const task = this.deps.getTask(projectId, id);
+    if (!task) return { error: `no such task: ${id} (project ${projectId})` };
+    return { result: task };
+  }
+
+  /**
+   * Shared dispatch seam for `assign_task` + `spawn_agent(goal)`: create a Task, launch a
+   * Task-bound worker via the group-7 launch wiring (back-channel MCP attached, Task id
+   * stamped into env, prompt contract appended — composed WITH the specialist persona
+   * when one is named), and bind the Task to the launched pane as its assignee (persisted
+   * via the board). The Task is put on the board ONLY after a successful launch, already
+   * bound, so a failed launch never leaves an orphan Task. Returns `{ taskId, paneId }`
+   * or a structured error.
+   */
+  private async dispatchTaskWorker(opts: {
+    projectId: string;
+    projPath: string;
+    goal: string;
+    prompt: string;
+    cwd: string;
+    specialistName?: string;
+  }): Promise<{ taskId: string; paneId: string } | { error: string }> {
+    const { projectId, projPath, goal, prompt, cwd, specialistName } = opts;
+
+    // Resolve the specialist DEFINITION when one is named — the same load path
+    // `spawn_agent` uses (its persona/model/tools compose into the worker launch).
+    let spec: import('../specialists/specialists').Specialist | undefined;
+    if (specialistName) {
+      try {
+        spec = await this.deps.loadSpecialist(projPath, specialistName);
+      } catch (err) {
+        return {
+          error: `could not load specialist "${specialistName}": ${err instanceof Error ? err.message : String(err)}`
+        };
+      }
+    }
+
+    // Resolve the installed back-channel adapter + control socket (same memoized
+    // round-trip the coordinator launch uses). Without them the back-channel can't attach.
+    const paths = await this.deps.usagePaths();
+    if (!paths) return { error: 'orchestration toolkit unavailable (could not resolve usage paths)' };
+
+    // Mint the Task (assigned) so its id can be stamped into the worker launch. It is
+    // NOT put on the board yet — only after a successful launch, already bound (below).
+    const task = newTask({ goal, projectId, now: Date.now(), specialist: specialistName ?? null });
+
+    // Compose the Task-bound worker launch via the group-7 seam: back-channel MCP config
+    // (control socket + Task id + project scope), Task id + prompt contract, and the
+    // specialist persona/model/tools when given.
+    const mcpConfig = buildBackChannelMcpConfig(
+      paths.backChannelAdapterPath,
+      paths.controlSocketPath,
+      task.id,
+      projectId
+    );
+    const extraArgs = taskWorkerLaunchArgs({ mcpConfig, taskId: task.id, specialist: spec ?? null });
+
+    // Attribute the worker to the project's coordinator (task 6.5) when one is driving.
+    const coordinatorPaneId = this.deps.coordinatorFor(projectId) ?? undefined;
+
+    const plan = buildLaunchPlan({ folder: cwd, prompt, placement: 'tab', projectId, taskId: task.id });
+    const paneId = this.deps.launch({
+      ...plan,
+      specialist: specialistName,
+      extraArgs,
+      coordinatorPaneId
+    });
+    if (!paneId) return { error: 'failed to launch agent' };
+
+    // Bind the Task to its worker pane (assignee) and put it on the board (persisted).
+    this.deps.upsertTask({ ...task, assigneePaneId: paneId, updatedAt: Date.now() });
+
+    return { taskId: task.id, paneId };
   }
 
   /**
@@ -797,6 +976,7 @@ function realDeps(): ExecutorDeps {
     loadSpecialist: loadSpecialistReal,
     launch: (plan) => workspace.launch(plan),
     coordinatorFor: coordinatorForReal,
+    usagePaths: () => getUsagePaths(),
     archive: (paneId) => workspace.closeAgent(paneId),
     unarchive: (paneId) => workspace.restoreAgent(paneId),
     schedule: (run, ms) => {
@@ -805,7 +985,8 @@ function realDeps(): ExecutorDeps {
     setCoordinatorNeedsInput: (paneId, message) => coordinatorNeedsInput.set(paneId, message),
     titleOf: (paneId) => titles.titleFor(paneId),
     getTask: (projectId, taskId) => taskBoard.getTask(projectId, taskId),
-    listTasks: (projectId) => taskBoard.listTasks(projectId),
+    listTasks: (projectId, state) => taskBoard.listTasks(projectId, state),
+    upsertTask: (task) => taskBoard.upsert(task),
     addNote: (projectId, taskId, text, ts) => taskBoard.addNote(projectId, taskId, text, ts),
     transitionTask: (projectId, taskId, to, patch) =>
       taskBoard.transition(projectId, taskId, to, patch),

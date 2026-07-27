@@ -54,7 +54,7 @@ const TOOLS = [
   {
     name: 'spawn_agent',
     description:
-      "Spawn a new claude agent pane in the coordinator's project. Optionally compose it from a specialist (.claude/agents/<name>.md) and/or a working directory.",
+      "Spawn a new claude agent pane in the coordinator's project. Optionally compose it from a specialist (.claude/agents/<name>.md) and/or a working directory. Pass a goal to also create a tracked Task, bind it to the pane, and dispatch the worker with the back-channel report tools (report_done/report_blocked/ask_coordinator).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -63,9 +63,54 @@ const TOOLS = [
           type: 'string',
           description: 'Optional specialist name to compose the agent from.'
         },
-        cwd: { type: 'string', description: 'Optional working directory for the agent.' }
+        cwd: { type: 'string', description: 'Optional working directory for the agent.' },
+        goal: {
+          type: 'string',
+          description:
+            'Optional Task goal. When set, a Task is created and bound to the new pane and the worker is dispatched with the back-channel report tools; the Task id is returned alongside the pane id.'
+        }
       },
       required: ['prompt']
+    }
+  },
+  {
+    name: 'assign_task',
+    description:
+      "Create a Task for a goal, spawn a worker to do it (optionally composed from a specialist), bind the Task to that worker, and dispatch it with the back-channel report tools. Returns the Task id and the worker's pane id.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goal: { type: 'string', description: 'What the Task should accomplish.' },
+        specialist: {
+          type: 'string',
+          description: 'Optional specialist name to compose the worker from.'
+        }
+      },
+      required: ['goal']
+    }
+  },
+  {
+    name: 'list_tasks',
+    description:
+      "List the coordinator project's Tasks, optionally filtered by state (assigned|working|blocked|input-required|done|failed).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        state: {
+          type: 'string',
+          description:
+            'Optional lifecycle state filter: assigned, working, blocked, input-required, done, or failed.'
+        }
+      }
+    }
+  },
+  {
+    name: 'get_task',
+    description: 'Get a single Task by id, returning its full details.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'The Task id (e.g. T3).' } },
+      required: ['id']
     }
   },
   {
