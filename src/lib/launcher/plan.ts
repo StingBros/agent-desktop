@@ -28,6 +28,15 @@ export interface LaunchRequest {
   /** OPTIONAL id of the project this session is launched under. */
   projectId?: string | null;
   /**
+   * OPTIONAL id of the Task this session is dispatched for (add-coordinator-task-
+   * backchannel, task 7.2). Present ONLY when the coordinator-tools group dispatches a
+   * worker for a Task (via `assign_task` / `spawn_agent(goal)`); absent for plain user
+   * sessions and the coordinator. Carried through verbatim so the pane can record which
+   * Task it is the assignee of. The back-channel wiring itself rides in `extraArgs`
+   * (built by `taskWorkerLaunchArgs`); this field is the plan-level record of the binding.
+   */
+  taskId?: string | null;
+  /**
    * OPTIONAL absolute path of the git worktree this session runs in (resolved by
    * the caller BEFORE building the plan, so the builder stays pure). Present only
    * when the project had `autoWorktree` and worktree creation succeeded.
@@ -62,6 +71,13 @@ export interface LaunchPlan {
    * the pane's registry entry; never inferred.
    */
   projectId: string | undefined;
+  /**
+   * The Task this session is dispatched for, or `undefined` for a plain session /
+   * the coordinator. Recorded verbatim on the pane's registry entry so the executor
+   * can bind the worker to its Task (assignee) and reconcile it on exit. Blank/missing
+   * collapses to `undefined`. Passthrough only — this builder never invents a Task id.
+   */
+  taskId: string | undefined;
   /**
    * OPTIONAL absolute path of the git worktree this session runs in (already the
    * `cwd` when present). Recorded verbatim on the pane's registry entry so a later
@@ -123,6 +139,11 @@ export function buildLaunchPlan(
       ? req.projectId
       : undefined;
 
+  // Carry the Task binding verbatim (blank/missing -> undefined), same passthrough rule
+  // as projectId. Set only when a worker is dispatched for a Task; never invented here.
+  const taskId =
+    typeof req.taskId === 'string' && req.taskId.trim() !== '' ? req.taskId : undefined;
+
   // Carry the resolved worktree path + base verbatim (blank/missing -> undefined),
   // same passthrough rule as projectId. Resolution happens BEFORE this builder.
   const worktreePath =
@@ -140,6 +161,7 @@ export function buildLaunchPlan(
     placement,
     initialInput,
     projectId,
+    taskId,
     worktreePath,
     worktreeBase
   };

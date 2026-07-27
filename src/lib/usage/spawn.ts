@@ -40,6 +40,14 @@ export interface UsagePaths {
    */
   adapterPath: string;
   /**
+   * Absolute path to the installed BACK-CHANNEL MCP adapter (`back-channel-mcp.cjs`)
+   * — `node <this>` is the `--mcp-config` server command for a Task-dispatched WORKER
+   * (see `buildBackChannelMcpConfig`). Sibling of `adapterPath`, sharing the same
+   * control socket (`controlSocketPath`). Only referenced when a worker is dispatched
+   * with a Task; plain sessions and the coordinator never attach it.
+   */
+  backChannelAdapterPath: string;
+  /**
    * Absolute path to the Rust orchestration CONTROL socket (sibling of `socketPath`)
    * — goes into the coordinator's `--mcp-config` server env as
    * `AGENT_DESKTOP_CONTROL_SOCKET` so the adapter can reach the executor.
@@ -326,4 +334,116 @@ export function buildMcpToolkitConfig(
       }
     }
   } as McpToolkitConfig;
+}
+
+// ── Worker back-channel (add-coordinator-task-backchannel, D2/D3) ────────────────
+//
+// The back-channel is a SECOND child-side MCP adapter (`back-channel-mcp.cjs`),
+// attached to a `claude` WORKER **only** when that worker is dispatched with a Task —
+// exactly as `orchestration-mcp.cjs` is attached to the coordinator. It exposes the
+// four worker tools (`report_progress`/`report_done`/`report_blocked`/`ask_coordinator`)
+// and forwards each call over the SAME Rust control socket the orchestration adapter
+// uses. Plain user sessions and the coordinator never get it.
+
+/**
+ * The MCP server name the back-channel toolset is registered under. Its tools surface
+ * to the worker as `mcp__backchannel__<tool>` (e.g. `mcp__backchannel__report_done`).
+ */
+export const BACK_CHANNEL_MCP_SERVER = 'backchannel';
+
+/**
+ * The env var the back-channel adapter reads for the worker's own Task id — must match
+ * the sidecar's `TASK_ID_ENV` (`back-channel-mcp.cjs`). Placed in the back-channel
+ * `--mcp-config` server env so the adapter stamps it onto every forwarded call's
+ * `args.taskId`; the executor scopes every back-channel op on it and FAILS CLOSED when
+ * it is absent (the worker LLM can't be relied on to pass its own Task id).
+ */
+export const TASK_ID_ENV = 'AGENT_DESKTOP_TASK_ID';
+
+/**
+ * The `--mcp-config` JSON that attaches the worker back-channel toolset to a
+ * Task-dispatched `claude` worker. Mirrors {@link McpToolkitConfig}: a single stdio
+ * MCP server (`backchannel`) runs the bundled back-channel adapter via
+ * `node <backChannelAdapterPath>` with the control-socket path AND the worker's Task/
+ * project scope in its env, so the adapter forwards each call to the Rust control
+ * socket already scoped to the worker's Task.
+ */
+export interface BackChannelMcpConfig {
+  mcpServers: {
+    backchannel: {
+      command: string;
+      args: string[];
+      env: {
+        /** The Rust control socket the adapter forwards to (same one the orchestration
+         *  adapter uses). */
+        AGENT_DESKTOP_CONTROL_SOCKET: string;
+        /** The worker's Task id — the adapter stamps it onto every forwarded call so the
+         *  executor can scope the op; REQUIRED (fail-closed without it). */
+        AGENT_DESKTOP_TASK_ID: string;
+        /** The worker's project id — merged into every forwarded call so the executor can
+         *  reject a Task in another project. */
+        AGENT_DESKTOP_PROJECT_ID: string;
+      };
+    };
+  };
+}
+
+/**
+ * The Task-contract instruction appended to a Task-dispatched worker's system prompt
+ * (design D3). Teaches the worker to drive its own lifecycle through the back-channel
+ * tools rather than going idle. The REAL Task id is interpolated so the worker knows
+ * which Task it is reporting on.
+ *
+ * NOTE: the worker's PANE env already carries `AGENT_DESKTOP_PANE` (from
+ * `buildSpawnOverride`), which the back-channel adapter inherits — so only the Task/
+ * project scope needs stamping into the back-channel `--mcp-config` env.
+ *
+ * Pure: depends only on `taskId`.
+ */
+export function taskContractPrompt(taskId: string): string {
+  return `You were dispatched to work on Task ${taskId}. When you finish, call report_done with a short result summary (and any artifact file paths). If you get stuck, call report_blocked. If you need a decision, call ask_coordinator. Do not wait idle — always report.`;
+}
+
+/**
+ * Build the per-worker `--mcp-config` content (task 7.1) that attaches the back-channel
+ * toolset to a Task-dispatched `claude` worker. The dispatch path (task 7.2 /
+ * `taskWorkerLaunchArgs`, consumed by the coordinator-tools group) passes the returned
+ * object `JSON.stringify`-ed as `--mcp-config`.
+ *
+ *  - `adapterPath` — absolute path to the installed `back-channel-mcp.cjs`
+ *    (`UsagePaths.backChannelAdapterPath`).
+ *  - `socketPath`  — absolute path to the Rust control socket
+ *    (`UsagePaths.controlSocketPath`; the SAME socket the orchestration adapter uses).
+ *  - `taskId`      — the worker's Task id. Placed in the server `env` as
+ *    `AGENT_DESKTOP_TASK_ID` so the adapter stamps it onto every forwarded call; the
+ *    executor scopes every back-channel op on it and fails closed without it.
+ *  - `projectId`   — the worker's project id. Placed in the server `env` as
+ *    `AGENT_DESKTOP_PROJECT_ID` so the executor can reject a cross-project Task.
+ *
+ * `AGENT_DESKTOP_PANE` is intentionally NOT set here: the pane id is generated inside
+ * `workspace.launch` (not known when these args are built), and the adapter already
+ * inherits the worker pane's own `AGENT_DESKTOP_PANE` env (stamped by
+ * `buildSpawnOverride`). Scope stamping needs only Task + project.
+ *
+ * Pure: depends only on its inputs.
+ */
+export function buildBackChannelMcpConfig(
+  adapterPath: string,
+  socketPath: string,
+  taskId: string,
+  projectId: string
+): BackChannelMcpConfig {
+  return {
+    mcpServers: {
+      [BACK_CHANNEL_MCP_SERVER]: {
+        command: 'node',
+        args: [adapterPath],
+        env: {
+          [CONTROL_SOCKET_ENV]: socketPath,
+          [TASK_ID_ENV]: taskId,
+          [PROJECT_ID_ENV]: projectId
+        }
+      }
+    }
+  } as BackChannelMcpConfig;
 }

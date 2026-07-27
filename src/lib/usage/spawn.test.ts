@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BACK_CHANNEL_MCP_SERVER,
+  buildBackChannelMcpConfig,
   buildMcpToolkitConfig,
   buildSpawnOverride,
   nodeCommand,
   quoteCommand,
+  taskContractPrompt,
   type UsagePaths
 } from './spawn';
 
@@ -19,6 +22,8 @@ const PATHS: UsagePaths = {
   eventHookPath: '/Users/me/Library/Application Support/agent-desktop/bin/event-hook.js',
   socketPath: '/Users/me/Library/Application Support/agent-desktop/events.sock',
   adapterPath: '/Users/me/Library/Application Support/agent-desktop/bin/orchestration-mcp.js',
+  backChannelAdapterPath:
+    '/Users/me/Library/Application Support/agent-desktop/bin/back-channel-mcp.js',
   controlSocketPath: '/Users/me/Library/Application Support/agent-desktop/control.sock'
 };
 
@@ -371,5 +376,54 @@ describe('buildMcpToolkitConfig', () => {
     });
     // Round-trips through JSON (it is passed as --mcp-config content).
     expect(JSON.parse(JSON.stringify(cfg))).toEqual(cfg);
+  });
+});
+
+describe('buildBackChannelMcpConfig', () => {
+  // Task 7.1: the per-worker --mcp-config the Task-dispatch path (7.2) consumes. Mirrors
+  // buildMcpToolkitConfig but names the back-channel adapter and stamps the worker's
+  // Task id + project scope into the server env (so the adapter forwards scoped calls).
+  it('names the back-channel adapter run via node with the socket + Task/project env', () => {
+    const cfg = buildBackChannelMcpConfig(
+      PATHS.backChannelAdapterPath,
+      PATHS.controlSocketPath,
+      'task-42',
+      'proj-1'
+    );
+    expect(cfg).toEqual({
+      mcpServers: {
+        backchannel: {
+          command: 'node',
+          args: [PATHS.backChannelAdapterPath],
+          env: {
+            AGENT_DESKTOP_CONTROL_SOCKET: PATHS.controlSocketPath,
+            // The worker's Task id — the adapter stamps it onto every forwarded call;
+            // the executor fails closed without it.
+            AGENT_DESKTOP_TASK_ID: 'task-42',
+            // The worker's project id — lets the executor reject a cross-project Task.
+            AGENT_DESKTOP_PROJECT_ID: 'proj-1'
+          }
+        }
+      }
+    });
+    // Registered under the documented server name (tools surface as mcp__backchannel__*).
+    expect(Object.keys(cfg.mcpServers)).toEqual([BACK_CHANNEL_MCP_SERVER]);
+    // No AGENT_DESKTOP_PANE in the config env — the adapter inherits it from the worker
+    // pane's own env (buildSpawnOverride stamps it); the pane id isn't known this early.
+    expect(cfg.mcpServers.backchannel.env).not.toHaveProperty('AGENT_DESKTOP_PANE');
+    // Round-trips through JSON (it is passed as --mcp-config content).
+    expect(JSON.parse(JSON.stringify(cfg))).toEqual(cfg);
+  });
+});
+
+describe('taskContractPrompt', () => {
+  it('interpolates the real Task id and names all three back-channel tools', () => {
+    const prompt = taskContractPrompt('T7');
+    expect(prompt).toContain('Task T7');
+    expect(prompt).toContain('report_done');
+    expect(prompt).toContain('report_blocked');
+    expect(prompt).toContain('ask_coordinator');
+    // A different id produces a different string (it really interpolates).
+    expect(taskContractPrompt('T8')).not.toEqual(prompt);
   });
 });
