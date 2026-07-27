@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Executor tests. Named `*.svelte.test.ts` so vitest compiles the module's runes
 // (the singleton at the bottom touches `$state` stores on import). We exercise the
@@ -13,6 +13,8 @@ import {
   type ExecutorDeps
 } from './executor.svelte';
 import type { Specialist } from '../specialists/specialists';
+import { taskBoard } from './taskBoard.svelte';
+import { newTask, resetTaskIds, type Task } from './tasks';
 
 const PROJ = 'proj-1';
 
@@ -41,6 +43,7 @@ function makeDeps(over: Partial<ExecutorDeps> = {}) {
   const archived: string[] = [];
   const unarchived: string[] = [];
   const coordNeeds: Array<{ paneId: string; message: string | null }> = [];
+  const written: Array<{ projectPath: string; taskId: string; name: string; content: string }> = [];
   const deps: ExecutorDeps = {
     reply: (id, outcome) => {
       replies.push({ id, outcome });
@@ -65,9 +68,22 @@ function makeDeps(over: Partial<ExecutorDeps> = {}) {
     schedule: (run) => run(), // run synchronously for deterministic tests
     setCoordinatorNeedsInput: (paneId, message) => coordNeeds.push({ paneId, message }),
     titleOf: () => null,
+    // Task-board deps delegate to the REAL singleton store so report handling is
+    // exercised against genuine lifecycle transitions + persistence-facing mutators
+    // (existing tests create no Tasks, so getTask→null / listTasks→[] leave them
+    // untouched). Report tests seed the board and assert via `taskBoard.getTask`.
+    getTask: (projectId, taskId) => taskBoard.getTask(projectId, taskId),
+    listTasks: (projectId) => taskBoard.listTasks(projectId),
+    addNote: (projectId, taskId, text, ts) => taskBoard.addNote(projectId, taskId, text, ts),
+    transitionTask: (projectId, taskId, to, patch) =>
+      taskBoard.transition(projectId, taskId, to, patch),
+    writeArtifact: async (projectPath, taskId, name, content) => {
+      written.push({ projectPath, taskId, name, content });
+      return `.agent-desktop/artifacts/${taskId}/${name}`;
+    },
     ...over
   };
-  return { deps, replies, launched, sent, archived, unarchived, coordNeeds };
+  return { deps, replies, launched, sent, archived, unarchived, coordNeeds, written };
 }
 
 describe('OrchestrationExecutor — scoping & safety (4.6)', () => {
@@ -397,5 +413,259 @@ describe('OrchestrationExecutor — request_user_input (tasks 10.11–10.12)', (
     await ex.onRequest({ id: 1, op: 'request_user_input', args: {} });
     expect(coordNeeds).toEqual([]);
     expect(replies[0].outcome.error).toMatch(/projectId/);
+  });
+});
+
+describe('OrchestrationExecutor — back-channel reports (tasks 5.1–5.4)', () => {
+  // The task board is a process singleton with no clear(), so each test uses a
+  // DISTINCT projectId to stay isolated (mirroring taskBoard.svelte.test.ts).
+  let projCounter = 0;
+  function freshProject(): string {
+    projCounter += 1;
+    return `bc-proj-${projCounter}`;
+  }
+  function seedTask(projectId: string, over: Partial<Task> = {}): Task {
+    const t: Task = { ...newTask({ goal: 'g', projectId, now: 1000 }), ...over };
+    taskBoard.upsert(t);
+    return t;
+  }
+  /** Build deps (projectPath resolvable so the by-reference path works), an executor,
+   *  and a spy on the group-8 `notifyCoordinator` stub. */
+  function setup(over: Partial<ExecutorDeps> = {}) {
+    const ctx = makeDeps({ projectPath: () => '/repo', ...over });
+    const ex = new OrchestrationExecutor(ctx.deps);
+    const notify = vi.spyOn(ex as unknown as { notifyCoordinator: () => void }, 'notifyCoordinator');
+    return { ...ctx, ex, notify };
+  }
+
+  beforeEach(() => resetTaskIds());
+
+  it('report_progress records a note, stays working, and does NOT notify', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { ex, replies, notify } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_progress',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', note: 'halfway' }
+    });
+    const after = taskBoard.getTask(proj, t.id)!;
+    expect(after.state).toBe('working');
+    expect(after.notes.map((n) => n.text)).toEqual(['halfway']);
+    expect(replies[0].outcome.result).toMatchObject({ ok: true, state: 'working' });
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('report_progress normalizes an `assigned` Task to `working` first', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'assigned' }); // not yet started
+    const { ex } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_progress',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', note: 'started' }
+    });
+    const after = taskBoard.getTask(proj, t.id)!;
+    expect(after.state).toBe('working');
+    expect(after.notes.map((n) => n.text)).toEqual(['started']);
+  });
+
+  it('report_done (small result) completes the Task inline and notifies done', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { ex, replies, notify, written } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: 'all green' }
+    });
+    const after = taskBoard.getTask(proj, t.id)!;
+    expect(after.state).toBe('done');
+    expect(after.result).toBe('all green');
+    expect(written).toEqual([]); // small → no by-reference write
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ id: t.id }), 'done');
+    expect(replies[0].outcome.result).toMatchObject({ ok: true, state: 'done' });
+  });
+
+  it('report_done (large result) stores by reference + keeps a short inline summary', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const big = 'x'.repeat(2001); // > RESULT_INLINE_MAX (2000)
+    const { ex, notify, written } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: big }
+    });
+    const after = taskBoard.getTask(proj, t.id)!;
+    expect(after.state).toBe('done');
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatchObject({ projectPath: '/repo', taskId: t.id, name: 'result.md' });
+    const rel = `.agent-desktop/artifacts/${t.id}/result.md`;
+    expect(after.artifacts).toContain(rel);
+    expect(after.result).toContain(rel); // inline summary references the artifact
+    expect((after.result ?? '').length).toBeLessThan(big.length);
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ id: t.id }), 'done');
+  });
+
+  it('report_done merges caller-supplied artifacts references', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { ex } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: 'done', artifacts: ['docs/out.md'] }
+    });
+    expect(taskBoard.getTask(proj, t.id)!.artifacts).toContain('docs/out.md');
+  });
+
+  it('report_blocked transitions to blocked with the reason and notifies', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { ex, notify } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_blocked',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', reason: 'needs API key' }
+    });
+    const after = taskBoard.getTask(proj, t.id)!;
+    expect(after.state).toBe('blocked');
+    expect(after.blockedReason).toBe('needs API key');
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ id: t.id }), 'blocked');
+  });
+
+  it('ask_coordinator moves to input-required with the question and notifies', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working' });
+    const { ex, notify } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'ask_coordinator',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', question: 'which db?' }
+    });
+    const after = taskBoard.getTask(proj, t.id)!;
+    expect(after.state).toBe('input-required');
+    expect(after.question).toBe('which db?');
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ id: t.id }), 'ask');
+  });
+
+  // ── Scope rejection (fail closed; task 5.1) ──────────────────────────────────
+
+  it('rejects a report with no orchestrator projectId (mutates nothing)', async () => {
+    const { ex, replies, notify } = setup();
+    await ex.onRequest({ id: 1, op: 'report_done', args: { taskId: 'T1', paneId: 'w1', result: 'x' } });
+    expect(replies[0].outcome.error).toMatch(/projectId/);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('rejects a report for an unknown taskId (mutates nothing)', async () => {
+    const proj = freshProject();
+    const { ex, replies, notify } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_progress',
+      args: { projectId: proj, taskId: 'nope', paneId: 'w1', note: 'x' }
+    });
+    expect(replies[0].outcome.error).toMatch(/no such task/);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('rejects a cross-project report (Task lives in another project)', async () => {
+    const home = freshProject();
+    const other = freshProject();
+    const t = seedTask(home, { state: 'working' });
+    const { ex, replies } = setup();
+    // Same taskId, but scoped to `other` — getTask(other, id) is null → fail closed.
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: other, taskId: t.id, paneId: 'w1', result: 'x' }
+    });
+    expect(replies[0].outcome.error).toMatch(/no such task/);
+    expect(taskBoard.getTask(home, t.id)!.state).toBe('working'); // untouched
+  });
+
+  it('rejects a report on an already-terminal Task', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'done', result: 'r' });
+    const { ex, replies, notify } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_blocked',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', reason: 'late' }
+    });
+    expect(replies[0].outcome.error).toMatch(/terminal/);
+    expect(taskBoard.getTask(proj, t.id)!.state).toBe('done'); // untouched
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  // ── report_done authoritative vs Stop/idle/exit (tasks 5.2 / 5.3) ────────────
+
+  it('only report_done reaches `done`; a lost assignee (exit/Stop) reconciles to `failed`', async () => {
+    const proj = freshProject();
+    // A worker whose pane exits while working: reconcile → failed, NEVER done.
+    const lost = seedTask(proj, { state: 'working', assigneePaneId: 'w1' });
+    const { ex } = setup({ locate: () => pane('w1', { projectId: proj }) });
+    ex.reconcileOnPaneExit('w1');
+    const failed = taskBoard.getTask(proj, lost.id)!;
+    expect(failed.state).toBe('failed');
+    expect(failed.blockedReason).toMatch(/assignee/i);
+
+    // A separate worker that actually reports done DOES complete.
+    const finished = seedTask(proj, { state: 'working', assigneePaneId: 'w2' });
+    await ex.onRequest({
+      id: 1,
+      op: 'report_done',
+      args: { projectId: proj, taskId: finished.id, paneId: 'w2', result: 'ok' }
+    });
+    expect(taskBoard.getTask(proj, finished.id)!.state).toBe('done');
+  });
+
+  it('reconcile-on-exit fails only non-terminal Tasks assigned to the exited pane', async () => {
+    const proj = freshProject();
+    const mine = seedTask(proj, { state: 'working', assigneePaneId: 'w1' });
+    const otherPane = seedTask(proj, { state: 'working', assigneePaneId: 'w2' });
+    const alreadyDone = seedTask(proj, { state: 'done', assigneePaneId: 'w1', result: 'r' });
+    const { ex } = setup({ locate: () => pane('w1', { projectId: proj }) });
+    ex.reconcileOnPaneExit('w1', 'assignee pane exited');
+    expect(taskBoard.getTask(proj, mine.id)!.state).toBe('failed');
+    expect(taskBoard.getTask(proj, otherPane.id)!.state).toBe('working'); // different pane
+    expect(taskBoard.getTask(proj, alreadyDone.id)!.state).toBe('done'); // terminal, untouched
+  });
+
+  it('reconcile-on-exit is a no-op when the pane cannot be located', () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'working', assigneePaneId: 'w1' });
+    const { ex } = setup({ locate: () => null });
+    ex.reconcileOnPaneExit('w1');
+    expect(taskBoard.getTask(proj, t.id)!.state).toBe('working');
+  });
+
+  // ── Single-writer serialization (task 5.4) ───────────────────────────────────
+
+  it('applies two reports to the same Task in order (single writer)', async () => {
+    const proj = freshProject();
+    const t = seedTask(proj, { state: 'assigned' });
+    const { ex } = setup();
+    await ex.onRequest({
+      id: 1,
+      op: 'report_progress',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', note: 'A' }
+    });
+    await ex.onRequest({
+      id: 2,
+      op: 'report_progress',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', note: 'B' }
+    });
+    await ex.onRequest({
+      id: 3,
+      op: 'report_done',
+      args: { projectId: proj, taskId: t.id, paneId: 'w1', result: 'fin' }
+    });
+    const after = taskBoard.getTask(proj, t.id)!;
+    expect(after.notes.map((n) => n.text)).toEqual(['A', 'B']); // ordered
+    expect(after.state).toBe('done');
+    expect(after.result).toBe('fin');
   });
 });

@@ -45,6 +45,15 @@ import { specialistLaunchArgs } from './launchArgs';
 import { buildLaunchPlan } from '../launcher/plan';
 import { findCoordinatorPane, type CoordinatorPaneView } from './coordinator';
 import { coordinatorNeedsInput } from './coordinatorNeedsInput.svelte';
+import { taskBoard } from './taskBoard.svelte';
+import {
+  needsArtifact,
+  RESULT_INLINE_MAX,
+  TERMINAL_STATES,
+  type Task,
+  type TaskPatch,
+  type TaskState
+} from './tasks';
 
 /** The Tauri event name the Rust control server emits each request on. */
 export const REQUEST_EVENT = 'orchestration://request';
@@ -127,6 +136,21 @@ export interface ExecutorDeps {
    *  none yet — used to identify an agent by a meaningful name instead of its raw
    *  "Session N" workspace name in `list_agents` / `inspect_agent`. */
   titleOf: (paneId: string) => string | null;
+
+  // ── Task board access (single-writer back-channel; task group 5) ─────────────
+  // The executor is the ONLY mutator of Task state (design D1 / D8). These wrap the
+  // shared `taskBoard` store so the handlers stay unit-testable with fakes.
+  /** A single Task by id within a project, or null when absent (scope check). */
+  getTask: (projectId: string, taskId: string) => Task | null;
+  /** Every Task in a project (used by lost-assignee reconciliation). */
+  listTasks: (projectId: string) => Task[];
+  /** Append a timestamped progress note to a Task (`report_progress`). */
+  addNote: (projectId: string, taskId: string, text: string, ts: number) => Task;
+  /** Transition a Task to `to`, applying `patch`; throws on an illegal edge/unknown id. */
+  transitionTask: (projectId: string, taskId: string, to: TaskState, patch?: TaskPatch) => Task;
+  /** Persist a large `report_done` result under `.agent-desktop/artifacts/<taskId>/`,
+   *  returning its project-root-relative path (Rust `coordinator_tasks_write_artifact`). */
+  writeArtifact: (projectPath: string, taskId: string, name: string, content: string) => Promise<string>;
 }
 
 /** How long to keep retrying a busy `message_agent` target before erroring (ms). */
@@ -201,6 +225,15 @@ export class OrchestrationExecutor {
         return this.unarchiveAgent(args);
       case 'request_user_input':
         return this.requestUserInput(args);
+      // ── Worker back-channel reports (task group 5) ───────────────────────────
+      case 'report_progress':
+        return this.reportProgress(args);
+      case 'report_done':
+        return this.reportDone(args);
+      case 'report_blocked':
+        return this.reportBlocked(args);
+      case 'ask_coordinator':
+        return this.askCoordinator(args);
       default:
         return { error: `unknown op: ${op}` };
     }
@@ -421,6 +454,200 @@ export class OrchestrationExecutor {
     return { result: { notified: true, paneId: coordinatorPaneId } };
   }
 
+  // ── Worker back-channel reports (task group 5) ─────────────────────────────
+  //
+  // The executor is the SINGLE WRITER of Task state (design D1 / D8): every worker
+  // report is validated (project + Task scope, fail-closed), applied as a lifecycle
+  // transition via the board, and — for done/blocked/ask — surfaced to the
+  // coordinator via `notifyCoordinator` (a group-8 stub for now). `report_done` is
+  // the ONLY path that reaches the terminal `done` state (design D6): a worker's
+  // Stop/idle is never treated as completion, and the only other terminal edge is
+  // the lost-assignee reconcile to `failed` (see `reconcileOnPaneExit`).
+
+  /**
+   * Validate a back-channel report's scope: the orchestrator `projectId` must be
+   * present AND a Task with `args.taskId` must exist IN THAT PROJECT. A Task in
+   * another project resolves to null here (getTask is project-scoped), so a
+   * cross-project report fails closed — mirroring the pane `projectId` guard.
+   */
+  private resolveTask(
+    args: Record<string, unknown>
+  ): { projectId: string; task: Task } | { error: string } {
+    const projectId = this.orchestratorProject(args);
+    if (!projectId) return { error: 'missing orchestrator projectId in args (scope required)' };
+    const taskId =
+      typeof args.taskId === 'string' && args.taskId.trim() !== '' ? args.taskId.trim() : '';
+    if (!taskId) return { error: 'missing taskId' };
+    const task = this.deps.getTask(projectId, taskId);
+    if (!task) return { error: `no such task: ${taskId} (project ${projectId})` };
+    return { projectId, task };
+  }
+
+  /**
+   * Move a non-terminal Task to `working` so a subsequent working→X edge is legal.
+   * `working` is reachable from every other non-terminal state (assigned / blocked /
+   * input-required), so a worker that reports (done/blocked/ask/progress) from any of
+   * them is normalized here first. A Task already `working` is returned unchanged.
+   * Callers MUST reject terminal Tasks before calling (see the handlers' guards).
+   */
+  private ensureWorking(projectId: string, task: Task): Task {
+    if (task.state === 'working') return task;
+    return this.deps.transitionTask(projectId, task.id, 'working', { updatedAt: Date.now() });
+  }
+
+  /**
+   * `report_progress({ taskId, projectId, note })`: append a progress note and keep
+   * the Task `working`. Board-only — it deliberately does NOT notify the coordinator
+   * (design "progress is board-only to avoid nagging"; spec agent-back-channel).
+   */
+  private reportProgress(args: Record<string, unknown>): OpResult {
+    const resolved = this.resolveTask(args);
+    if ('error' in resolved) return resolved;
+    const { projectId, task } = resolved;
+    if (TERMINAL_STATES.has(task.state)) {
+      return { error: `task ${task.id} is already terminal (${task.state})` };
+    }
+    const note = typeof args.note === 'string' ? args.note : '';
+    this.ensureWorking(projectId, task);
+    this.deps.addNote(projectId, task.id, note, Date.now());
+    return { result: { ok: true, taskId: task.id, state: 'working' } };
+  }
+
+  /**
+   * `report_done({ taskId, projectId, result, artifacts? })`: the AUTHORITATIVE
+   * completion signal (design D6). Records the result — inline when short, else
+   * written by reference to `.agent-desktop/artifacts/<taskId>/` with a short inline
+   * summary kept (design D7) — then transitions the Task to the terminal `done`
+   * state and notifies the coordinator. This is the ONLY path that sets `done`.
+   */
+  private async reportDone(args: Record<string, unknown>): Promise<OpResult> {
+    const resolved = this.resolveTask(args);
+    if ('error' in resolved) return resolved;
+    const { projectId, task } = resolved;
+    if (TERMINAL_STATES.has(task.state)) {
+      return { error: `task ${task.id} is already terminal (${task.state})` };
+    }
+    const result = typeof args.result === 'string' ? args.result : '';
+    const extraArtifacts = Array.isArray(args.artifacts)
+      ? args.artifacts.filter((a): a is string => typeof a === 'string')
+      : [];
+
+    let inlineResult = result;
+    let artifacts = [...task.artifacts, ...extraArtifacts];
+    if (needsArtifact(result)) {
+      const projPath = this.deps.projectPath(projectId);
+      if (projPath) {
+        try {
+          const rel = await this.deps.writeArtifact(projPath, task.id, 'result.md', result);
+          artifacts = [...artifacts, rel];
+          inlineResult = summarizeResult(result, rel);
+        } catch {
+          // Artifact write failed — keep a truncated inline result so completion is
+          // never blocked on disk I/O (the board is the durable record either way).
+          inlineResult = result.slice(0, RESULT_INLINE_MAX);
+        }
+      } else {
+        inlineResult = result.slice(0, RESULT_INLINE_MAX);
+      }
+    }
+
+    this.ensureWorking(projectId, task);
+    const done = this.deps.transitionTask(projectId, task.id, 'done', {
+      result: inlineResult,
+      artifacts,
+      updatedAt: Date.now()
+    });
+    this.notifyCoordinator(done, 'done');
+    return { result: { ok: true, taskId: task.id, state: 'done', artifacts } };
+  }
+
+  /**
+   * `report_blocked({ taskId, projectId, reason })`: transition the Task to `blocked`,
+   * record the reason, and notify the coordinator so it can act (spec).
+   */
+  private reportBlocked(args: Record<string, unknown>): OpResult {
+    const resolved = this.resolveTask(args);
+    if ('error' in resolved) return resolved;
+    const { projectId, task } = resolved;
+    if (TERMINAL_STATES.has(task.state)) {
+      return { error: `task ${task.id} is already terminal (${task.state})` };
+    }
+    const reason = typeof args.reason === 'string' ? args.reason : '';
+    this.ensureWorking(projectId, task);
+    const blocked = this.deps.transitionTask(projectId, task.id, 'blocked', {
+      blockedReason: reason,
+      updatedAt: Date.now()
+    });
+    this.notifyCoordinator(blocked, 'blocked');
+    return { result: { ok: true, taskId: task.id, state: 'blocked' } };
+  }
+
+  /**
+   * `ask_coordinator({ taskId, projectId, question })`: record the question, move the
+   * Task to `input-required`, and notify the coordinator so it can answer via its
+   * existing agent-messaging tool. Plumbing only — no user escalation, no
+   * `AskUserQuestion` interception (spec; that governance is Phase 2).
+   */
+  private askCoordinator(args: Record<string, unknown>): OpResult {
+    const resolved = this.resolveTask(args);
+    if ('error' in resolved) return resolved;
+    const { projectId, task } = resolved;
+    if (TERMINAL_STATES.has(task.state)) {
+      return { error: `task ${task.id} is already terminal (${task.state})` };
+    }
+    const question = typeof args.question === 'string' ? args.question : '';
+    this.ensureWorking(projectId, task);
+    const asked = this.deps.transitionTask(projectId, task.id, 'input-required', {
+      question,
+      updatedAt: Date.now()
+    });
+    this.notifyCoordinator(asked, 'ask');
+    return { result: { ok: true, taskId: task.id, state: 'input-required' } };
+  }
+
+  /**
+   * LOST-ASSIGNEE RECONCILIATION (task 5.3 / design D7): when a worker pane exits or
+   * errors, any non-terminal Task assigned to it is reconciled to `failed` with a
+   * reason, rather than being left stuck in a non-terminal state forever. This is the
+   * ONLY non-`report_done` terminal edge — a Stop/idle is never completion (D6); a
+   * lost assignee is a failure.
+   *
+   * This is the single-writer seam the app's existing pane-exit signal drives (the
+   * PTY-exit path in `TerminalPane.svelte` → `runtime.noteExit`). It resolves the
+   * pane's project via the read-only `locate` dep, so it must be called while the
+   * pane is still registered. Idempotent: a terminal Task, or a pane with no
+   * assigned Task, is a no-op.
+   *
+   * TODO(wiring): the app should invoke `executor.reconcileOnPaneExit(paneId)` from
+   * the pane-exit path (alongside `noteExit`); that one-line wiring lives outside
+   * this task's edit scope (executor + its test only).
+   */
+  reconcileOnPaneExit(paneId: string, reason = 'assignee pane exited'): void {
+    const projectId = this.deps.locate(paneId)?.session.projectId ?? null;
+    if (!projectId) return;
+    for (const task of this.deps.listTasks(projectId)) {
+      if (task.assigneePaneId !== paneId) continue;
+      if (TERMINAL_STATES.has(task.state)) continue;
+      this.deps.transitionTask(projectId, task.id, 'failed', {
+        blockedReason: reason,
+        updatedAt: Date.now()
+      });
+    }
+  }
+
+  /**
+   * TODO(group 8): push-when-idle coordinator notification. On a report warranting
+   * action (`done`/`blocked`/`ask`) this will inject a compact structured line into
+   * the project coordinator's pane when it is idle (reusing the idle-gated
+   * `message_agent` path), deferring when busy — the board stays the durable record
+   * (design D5 / spec "Reports push to the coordinator when it is idle"). Until group
+   * 8 wires that, this is a no-op stub (it only logs) so groups 5 and 8 do not
+   * collide on this file. Deliberately NOT called for `report_progress`.
+   */
+  private notifyCoordinator(task: Task, kind: 'done' | 'blocked' | 'ask'): void {
+    console.debug(`[task ${task.id}] notifyCoordinator(${kind}) — stub (wired in group 8)`);
+  }
+
   /** Build the `AgentInfo` for a located pane. */
   private infoFor(pane: LocatedPane): AgentInfo {
     return {
@@ -436,6 +663,16 @@ export class OrchestrationExecutor {
       specialist: pane.session.specialist ?? null
     };
   }
+}
+
+/** Max chars of a large `report_done` result kept inline as a preview alongside its
+ *  artifact reference (the full text lives on disk — see {@link needsArtifact}). */
+const RESULT_SUMMARY_PREVIEW = 200;
+
+/** A short inline summary for a by-reference result: a leading preview + the path. */
+function summarizeResult(result: string, relPath: string): string {
+  const preview = result.slice(0, RESULT_SUMMARY_PREVIEW).trim();
+  return `${preview}… (full result stored at ${relPath})`;
 }
 
 /** Coerce an unknown args value into a plain object (null/non-object → {}). */
@@ -566,7 +803,14 @@ function realDeps(): ExecutorDeps {
       setTimeout(run, ms);
     },
     setCoordinatorNeedsInput: (paneId, message) => coordinatorNeedsInput.set(paneId, message),
-    titleOf: (paneId) => titles.titleFor(paneId)
+    titleOf: (paneId) => titles.titleFor(paneId),
+    getTask: (projectId, taskId) => taskBoard.getTask(projectId, taskId),
+    listTasks: (projectId) => taskBoard.listTasks(projectId),
+    addNote: (projectId, taskId, text, ts) => taskBoard.addNote(projectId, taskId, text, ts),
+    transitionTask: (projectId, taskId, to, patch) =>
+      taskBoard.transition(projectId, taskId, to, patch),
+    writeArtifact: (projectPath, taskId, name, content) =>
+      invoke<string>('coordinator_tasks_write_artifact', { projectPath, taskId, name, content })
   };
 }
 
