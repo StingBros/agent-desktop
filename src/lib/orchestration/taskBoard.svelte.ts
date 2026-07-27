@@ -9,20 +9,122 @@
 // without runes); this store only holds state reactively and delegates every
 // transition to `applyTransition`. Framework-coupled (`$state`), hence `.svelte.ts`.
 //
-// PERSISTENCE (task group 2) is intentionally NOT here yet: this store is purely
-// in-memory. A clearly-marked `markDirty()` hook fires after every mutation and is
-// where the debounced Rust `coordinator_tasks_save` call will be wired.
+// PERSISTENCE (task group 2): every mutation fires `markDirty(projectId)`, which
+// debounces a Rust `coordinator_tasks_save(projectPath, json)` write to that
+// project's `.agent-desktop/coordinator-tasks.json` (design D1 — single writer,
+// atomic snapshot). `load(projectId, projectPath)` hydrates the board from that
+// file on project activation and seeds the Task-id counter so freshly-minted ids
+// never collide with reloaded ones. The executor remains the ONLY mutator.
 
+import { invoke } from '@tauri-apps/api/core';
 import {
   applyTransition,
+  seedTaskIds,
+  taskIdNumber,
   type Task,
   type TaskPatch,
   type TaskState
 } from './tasks';
 
+/**
+ * The on-disk snapshot shape for `.agent-desktop/coordinator-tasks.json`. Versioned
+ * for forward-compat (mirrors the project `tasks.json`/`config.json` convention);
+ * the store owns this format since it is the sole reader/writer.
+ */
+interface BoardSnapshot {
+  version: 1;
+  tasks: Task[];
+}
+
+/** Debounce window for the persist flush — coalesces a burst of mutations into one write. */
+const PERSIST_DEBOUNCE_MS = 250;
+
 /** Reactive `projectId → Task[]` board. */
 class TaskBoardStore {
   private board = $state<Record<string, Task[]>>({});
+
+  /**
+   * `projectId → projectPath`, learned on {@link load}. Persistence needs the
+   * project's filesystem path (the board keys only by id), so a project must be
+   * loaded before its mutations can be flushed; a mutation to an unknown project
+   * is kept in memory and logged (never silently persisted to the wrong place).
+   */
+  private paths: Record<string, string> = {};
+
+  /** Pending per-project debounce timers for the persist flush. */
+  private persistTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+
+  /**
+   * When true, {@link markDirty} is suppressed — set while {@link load} hydrates the
+   * board from disk so reading the file never immediately rewrites it.
+   */
+  private hydrating = false;
+
+  // ── Persistence (task group 2) ───────────────────────────────────────────────
+
+  /**
+   * Hydrate a project's board from `.agent-desktop/coordinator-tasks.json` and record
+   * its `projectPath` for subsequent persistence. Called on project activation. An
+   * absent file (Rust returns null) is an EMPTY board (spec: "Absent file is an empty
+   * board"). After hydrating, the Task-id counter is seeded above the max numeric
+   * suffix among loaded ids so {@link nextTaskId} cannot collide with a reloaded id.
+   * IO/parse failures are logged and leave the board empty rather than throwing.
+   */
+  async load(projectId: string, projectPath: string): Promise<void> {
+    this.paths[projectId] = projectPath;
+    let raw: string | null = null;
+    try {
+      raw = await invoke<string | null>('coordinator_tasks_load', { projectPath });
+    } catch (err) {
+      console.error('coordinator_tasks_load failed', projectId, err);
+      return;
+    }
+    if (!raw) return; // absent file → empty board.
+
+    let tasks: Task[] = [];
+    try {
+      const parsed = JSON.parse(raw) as Partial<BoardSnapshot>;
+      tasks = Array.isArray(parsed?.tasks) ? (parsed.tasks as Task[]) : [];
+    } catch (err) {
+      console.error('coordinator_tasks_load: malformed JSON', projectId, err);
+      return;
+    }
+
+    this.hydrating = true;
+    try {
+      this.board = { ...this.board, [projectId]: tasks };
+    } finally {
+      this.hydrating = false;
+    }
+
+    // Seed the id counter above the highest T<n> suffix so new ids never collide
+    // with reloaded ones (seedTaskIds never lowers the counter, so loading several
+    // projects is safe).
+    let maxSeen = 0;
+    for (const t of tasks) {
+      const n = taskIdNumber(t.id);
+      if (n !== null && n > maxSeen) maxSeen = n;
+    }
+    seedTaskIds(maxSeen);
+  }
+
+  /**
+   * Serialize a project's board and persist it via the Rust `coordinator_tasks_save`
+   * command. No-op (with a warning) when the project's path is unknown — a project
+   * must be {@link load}ed before its mutations can be flushed.
+   */
+  private persistNow(projectId: string): void {
+    const projectPath = this.paths[projectId];
+    if (!projectPath) {
+      console.warn('taskBoard: cannot persist unloaded project (no path)', projectId);
+      return;
+    }
+    const snapshot: BoardSnapshot = { version: 1, tasks: this.board[projectId] ?? [] };
+    void invoke('coordinator_tasks_save', {
+      projectPath,
+      json: JSON.stringify(snapshot)
+    }).catch((err) => console.error('coordinator_tasks_save failed', projectId, err));
+  }
 
   // ── Selectors ──────────────────────────────────────────────────────────────
 
@@ -93,13 +195,19 @@ class TaskBoardStore {
   }
 
   /**
-   * TODO (task group 2 — per-project JSON persistence): debounce and call the Rust
-   * `coordinator_tasks_save(projectPath, json)` command here so each mutation is
-   * flushed to `.agent-desktop/coordinator-tasks.json`. Intentionally a no-op for
-   * now — this store is the in-memory source of truth only.
+   * Fired after every mutation: debounce a `coordinator_tasks_save` flush of the
+   * project's board to `.agent-desktop/coordinator-tasks.json` (design D1). A burst
+   * of mutations within {@link PERSIST_DEBOUNCE_MS} coalesces into a single write.
+   * Suppressed while {@link load} is hydrating (reading the file must not rewrite it).
    */
-  private markDirty(_projectId: string): void {
-    // no-op until task group 2 wires persistence
+  private markDirty(projectId: string): void {
+    if (this.hydrating) return;
+    const existing = this.persistTimers[projectId];
+    if (existing) clearTimeout(existing);
+    this.persistTimers[projectId] = setTimeout(() => {
+      delete this.persistTimers[projectId];
+      this.persistNow(projectId);
+    }, PERSIST_DEBOUNCE_MS);
   }
 }
 

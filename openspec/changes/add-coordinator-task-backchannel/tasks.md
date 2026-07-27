@@ -1,19 +1,19 @@
 ## 1. Task model & board store (frontend)
 
-- [ ] 1.1 Define the `Task` type and lifecycle states (`assigned | working | blocked | input-required | done | failed`) plus the transition helper in a new `src/lib/orchestration/tasks.ts` (pure, framework-free), with unit tests for legal/illegal transitions and terminal-state rules.
-- [ ] 1.2 Add a reactive task-board store `src/lib/orchestration/taskBoard.svelte.ts`: in-memory `Record<projectId, Task[]>`, selectors (`listTasks(projectId, state?)`, `getTask(projectId, id)`), and mutators that the executor calls. Tests for selectors + mutation ordering.
-- [ ] 1.3 Implement id generation and artifact-reference helpers (result-summary size cap; large results resolve to `.agent-desktop/artifacts/<taskId>/…` paths). Tests for the size-cap/by-reference boundary.
+- [x] 1.1 Define the `Task` type and lifecycle states (`assigned | working | blocked | input-required | done | failed`) plus the transition helper in a new `src/lib/orchestration/tasks.ts` (pure, framework-free), with unit tests for legal/illegal transitions and terminal-state rules.
+- [x] 1.2 Add a reactive task-board store `src/lib/orchestration/taskBoard.svelte.ts`: in-memory `Record<projectId, Task[]>`, selectors (`listTasks(projectId, state?)`, `getTask(projectId, id)`), and mutators that the executor calls. Tests for selectors + mutation ordering.
+- [x] 1.3 Implement id generation and artifact-reference helpers (result-summary size cap; large results resolve to `.agent-desktop/artifacts/<taskId>/…` paths). Tests for the size-cap/by-reference boundary.
 
 ## 2. Per-project JSON persistence (Rust)
 
-- [ ] 2.1 Add Rust commands `coordinator_tasks_load(projectPath)` and `coordinator_tasks_save(projectPath, json)` in `src-tauri/src/lib.rs` (or a small `tasks_store.rs`), writing `.agent-desktop/coordinator-tasks.json` with atomic tmp+rename (reuse the statusline snapshot write pattern). Register in the handler.
-- [ ] 2.2 Add an artifacts writer that persists a large result under `.agent-desktop/artifacts/<taskId>/` and returns its relative path. Rust unit/integration test for atomic write + reload round-trip.
-- [ ] 2.3 Wire the board store to load on project activation and persist (debounced) after each mutation via the new commands.
+- [x] 2.1 Add Rust commands `coordinator_tasks_load(projectPath)` and `coordinator_tasks_save(projectPath, json)` in `src-tauri/src/lib.rs` (or a small `tasks_store.rs`), writing `.agent-desktop/coordinator-tasks.json` with atomic tmp+rename (reuse the statusline snapshot write pattern). Register in the handler.
+- [x] 2.2 Add an artifacts writer that persists a large result under `.agent-desktop/artifacts/<taskId>/` and returns its relative path. Rust unit/integration test for atomic write + reload round-trip.
+- [x] 2.3 Wire the board store to load on project activation and persist (debounced) after each mutation via the new commands.
 
 ## 3. Back-channel MCP sidecar
 
-- [ ] 3.1 Create `src-tauri/resources/back-channel-mcp.cjs` — a stdio MCP server exposing `report_progress`, `report_done`, `report_blocked`, `ask_coordinator`, mirroring the structure of `orchestration-mcp.cjs`. It reads `AGENT_DESKTOP_TASK_ID` (+ project/pane env) and stamps them onto every forwarded call; forwards over the control socket; fails closed with a structured error when the Task id is unresolved.
-- [ ] 3.2 Add a `back-channel-mcp.test.ts` covering arg stamping, the four tools' request shapes, and the fail-closed path.
+- [x] 3.1 Create `src-tauri/resources/back-channel-mcp.cjs` — a stdio MCP server exposing `report_progress`, `report_done`, `report_blocked`, `ask_coordinator`, mirroring the structure of `orchestration-mcp.cjs`. It reads `AGENT_DESKTOP_TASK_ID` (+ project/pane env) and stamps them onto every forwarded call; forwards over the control socket; fails closed with a structured error when the Task id is unresolved.
+- [x] 3.2 Add a `back-channel-mcp.test.ts` covering arg stamping, the four tools' request shapes, and the fail-closed path.
 - [ ] 3.3 Install the new sidecar alongside the existing baked resources (extend `install_usage_assets` / resource baking in `src-tauri/src/lib.rs`); expose its installed path for launch wiring.
 
 ## 4. Control-socket routing (Rust)

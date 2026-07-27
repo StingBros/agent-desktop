@@ -177,6 +177,26 @@ export function resetTaskIds(to = 0): void {
   taskIdCounter = to;
 }
 
+/** Parse the numeric suffix of a `T<n>` id, or null when it isn't one (e.g. `T` or `Tx`). */
+export function taskIdNumber(id: string): number | null {
+  if (!id.startsWith(TASK_ID_PREFIX)) return null;
+  const n = Number(id.slice(TASK_ID_PREFIX.length));
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * Seed the id counter so subsequent {@link nextTaskId} calls will NOT collide with
+ * ids already in existence — used on the persistence-reload path (task group 2)
+ * after hydrating a board from disk. Advances the counter to `maxSeen` (the highest
+ * numeric suffix among loaded ids); never lowers it, so seeding from several projects
+ * is safe. Non-`T<n>` ids should be pre-filtered via {@link taskIdNumber}.
+ */
+export function seedTaskIds(maxSeen: number): void {
+  if (Number.isInteger(maxSeen) && maxSeen > taskIdCounter) {
+    taskIdCounter = maxSeen;
+  }
+}
+
 /** Fields {@link newTask} needs; `now` is passed in (the module never reads the clock). */
 export interface NewTaskFields {
   goal: string;

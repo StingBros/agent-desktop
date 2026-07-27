@@ -15,6 +15,7 @@ pub mod shell_path;
 pub mod specialists;
 pub mod subagents;
 pub mod task;
+pub mod tasks_store;
 pub mod transcribe;
 pub mod usage;
 pub mod vad;
@@ -934,6 +935,39 @@ fn project_config_save(project_path: String, json: String) -> Result<(), String>
     project_store::save_config(Path::new(&project_path), &json)
 }
 
+/// Load a project's coordinator Task board (`.agent-desktop/coordinator-tasks.json`),
+/// or `None` when it does not exist yet (an empty board). See
+/// [`tasks_store::load_board`].
+#[tauri::command]
+fn coordinator_tasks_load(project_path: String) -> Result<Option<String>, String> {
+    tasks_store::load_board(Path::new(&project_path))
+}
+
+/// Atomically persist a project's coordinator Task board (atomic temp+rename,
+/// creating the dir if needed). See [`tasks_store::save_board`].
+#[tauri::command]
+fn coordinator_tasks_save(project_path: String, json: String) -> Result<(), String> {
+    tasks_store::save_board(Path::new(&project_path), &json)
+}
+
+/// Persist a large Task result as an artifact under `.agent-desktop/artifacts/
+/// <task_id>/<name>` (default `result.md`) and return its project-root-relative,
+/// POSIX-style path. See [`tasks_store::write_artifact`].
+#[tauri::command]
+fn coordinator_tasks_write_artifact(
+    project_path: String,
+    task_id: String,
+    name: Option<String>,
+    content: String,
+) -> Result<String, String> {
+    tasks_store::write_artifact(
+        Path::new(&project_path),
+        &task_id,
+        name.as_deref(),
+        &content,
+    )
+}
+
 /// Resolve `<app_data_dir>`, creating it if needed.
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
@@ -1587,6 +1621,9 @@ pub fn run() {
             project_tasks_save,
             project_config_load,
             project_config_save,
+            coordinator_tasks_load,
+            coordinator_tasks_save,
+            coordinator_tasks_write_artifact,
             usage_paths,
             usage_snapshots,
             subagents_for,

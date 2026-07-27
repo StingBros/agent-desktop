@@ -61,6 +61,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { events } from '$lib/overview/events.svelte';
   import { executor } from '$lib/orchestration/executor.svelte';
+  import { taskBoard } from '$lib/orchestration/taskBoard.svelte';
   import { checkForUpdateOnLaunch, startUpdatePolling } from '$lib/updates/checkForUpdate';
   import { updateStore } from '$lib/updates/updateStore.svelte';
   import { titles } from '$lib/overview/titles.svelte';
@@ -207,6 +208,13 @@
     );
     void projects.load().then(() => {
       projectTasks.load();
+      // Hydrate the COORDINATOR TASK BOARD (add-coordinator-task-backchannel, task
+      // 2.3) for every project now that the list (and thus each project's folder
+      // path) is known. This is the project-activation hook: it seeds the in-memory
+      // board from each `.agent-desktop/coordinator-tasks.json` and registers the
+      // path so subsequent executor mutations debounce-persist to the right project.
+      // (The executor's report handling — group 5 — is not wired here.)
+      for (const p of projects.list) void taskBoard.load(p.id, p.path);
       // Initial background remote fetch, once the project list is populated (the
       // recurring interval below is mount-once and at mount the list is still
       // empty). Refresh status after so the advanced ahead/behind surfaces promptly
