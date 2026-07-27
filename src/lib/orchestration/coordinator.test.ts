@@ -156,7 +156,7 @@ describe('coordinatorLaunchArgs (task 6.2)', () => {
   });
 });
 
-describe('ORCHESTRATOR_SYSTEM_PROMPT (task 6.4)', () => {
+describe('ORCHESTRATOR_SYSTEM_PROMPT (task-board driven, tasks 9.1–9.2)', () => {
   it('is a focused orchestrator prompt with NO governance/guardrails', () => {
     expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/coordinat/i);
     expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/spawn_agent/);
@@ -164,13 +164,50 @@ describe('ORCHESTRATOR_SYSTEM_PROMPT (task 6.4)', () => {
     expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/guardrail|approval/i);
   });
 
-  it('instructs the coordinator to delegate via spawn_agent and never do work itself (task 10.1)', () => {
+  it('instructs the coordinator to delegate via the task tools and never do work itself (task 10.1)', () => {
     // Must NOT do hands-on work directly.
     expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/do not|don't|never/i);
-    // Must delegate via spawn_agent.
+    // Must delegate via assign_task, with spawn_agent(goal) as the shortcut.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/assign_task/);
     expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/spawn_agent/);
-    // Must not use the Task tool.
+    // Must not use the internal Task tool.
     expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/Task tool/);
+  });
+
+  it('drives off the Task board and pushed reports, not a poll loop (tasks 9.1, D5)', () => {
+    // Breaks a goal into Tasks, one unit of work each.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/Task board/);
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/one .*unit of work per Task/i);
+    // Explicitly NOT a poll loop; reacts to pushed reports instead.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/poll loop/i);
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/push/i);
+    // Reacts to the three structured report kinds.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/DONE/);
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/BLOCKED/);
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/QUESTION/);
+    // May reconcile via the board read tools, but need not poll.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/list_tasks/);
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/get_task/);
+    // Answers a worker's question/block via message_agent.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/message_agent/);
+  });
+
+  it('treats report_done as authoritative completion and verifies via read_agent (task 9.1, D6)', () => {
+    // report_done is the authoritative completion signal.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/report_done/);
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/authoritative/i);
+    // Do NOT infer completion from a worker going quiet/idle.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/quiet|idle/i);
+    // Verify a result's detail with read_agent.
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/read_agent/);
+  });
+
+  it('remains an interactive chat surface for the user (spec: coordinator remains a chat surface)', () => {
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/chat surface/i);
+  });
+
+  it('archives finished agents it spawned (preserved rule)', () => {
+    expect(ORCHESTRATOR_SYSTEM_PROMPT).toMatch(/archive_agent/);
   });
 
   it('instructs the coordinator to call request_user_input when it needs you (tasks 10.11–10.12)', () => {
