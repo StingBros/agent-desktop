@@ -21,6 +21,7 @@
 
 import type { Snapshot, SnapshotMap } from '../usage/snapshots.svelte';
 import type { EventActivity } from './events';
+import { TERMINAL_STATES, type Task, type TaskState } from '../orchestration/tasks';
 
 /**
  * An agent's live status, derived from its terminal activity + process state:
@@ -333,6 +334,41 @@ export interface RowActivity {
 export type ActivityMap = Record<string, RowActivity>;
 
 /**
+ * The live `pane_id -> Task[]` map the Overview feeds into `buildRoster` for
+ * coordinator-task attribution (task 10.1). Each key is a worker pane's id; the
+ * value is every {@link Task} whose `assigneePaneId` equals that pane — sourced by
+ * the reactive Overview wrapper from the per-project `taskBoard` (grouped by
+ * assignee), NOT read here (roster.ts stays framework-free with no store/Tauri
+ * dependency). A pane with no assigned Task is simply absent from the map. Passing
+ * a paneId-keyed map (rather than the raw board) keeps the lookup O(1) per row and
+ * fully derived — no new polling.
+ */
+export type TaskMap = Record<string, Task[]>;
+
+/**
+ * PURE: pick a pane's CURRENT Task from every Task assigned to it, for roster
+ * attribution. Prefers the most-recently-updated NON-TERMINAL Task (a worker's
+ * live work); when the pane has only terminal (`done`/`failed`) Tasks it falls
+ * back to the most-recently-updated one overall (so a just-finished worker still
+ * shows what it last did). Recency is `updatedAt` (the last-mutation stamp),
+ * tie-broken by `createdAt` then higher `id` for determinism. Returns null for an
+ * absent/empty list. Never mutates its input.
+ */
+export function selectCurrentTask(tasks: Task[] | undefined): Task | null {
+  if (!tasks || tasks.length === 0) return null;
+  const nonTerminal = tasks.filter((t) => !TERMINAL_STATES.has(t.state));
+  const pool = nonTerminal.length > 0 ? nonTerminal : tasks;
+  return pool.reduce((best, t) => (moreRecentTask(t, best) ? t : best));
+}
+
+/** True when task `a` is "more recent" than `b`: later updatedAt, then createdAt, then id. */
+function moreRecentTask(a: Task, b: Task): boolean {
+  if (a.updatedAt !== b.updatedAt) return a.updatedAt > b.updatedAt;
+  if (a.createdAt !== b.createdAt) return a.createdAt > b.createdAt;
+  return a.id > b.id;
+}
+
+/**
  * Output newer than this (ms) counts as "working". It must exceed claude's
  * spinner/token cadence (it re-renders several times a second while working) so
  * an active agent stays `working`, yet be short enough that going quiet flips to
@@ -517,6 +553,19 @@ export interface AgentRow {
    *  you just launched yourself is no surprise); it does NOT affect the attention lane.
    *  Optional: `rowFor` always sets it, but roster fixtures may omit it. */
   everPrompted?: boolean;
+  /** The id of the coordinator Task this agent is currently executing (its most-recent
+   *  non-terminal Task, else its most-recent terminal one — see {@link selectCurrentTask}),
+   *  or null when no Task is assigned to the pane. Surfaced so the roster can attribute
+   *  the worker to its Task (task 10.1) without a dedicated board panel. Optional:
+   *  `rowFor` always sets it, but roster fixtures may omit it. */
+  taskId?: string | null;
+  /** The current Task's goal (what it is to accomplish), or null when no Task is
+   *  assigned. The Overview may truncate it to a short label. Optional; see `taskId`. */
+  taskGoal?: string | null;
+  /** The current Task's lifecycle state (`assigned`/`working`/`blocked`/
+   *  `input-required`/`done`/`failed`), or null when no Task is assigned. Optional;
+   *  see `taskId`. */
+  taskState?: TaskState | null;
 }
 
 /** Coerce to a finite number, else null (guards NaN/Infinity/strings). */
@@ -592,7 +641,8 @@ function rowFor(
   event: EventActivity | undefined,
   nowMs: number,
   workingWindowMs: number,
-  coordFlag: boolean
+  coordFlag: boolean,
+  tasks: Task[] | undefined
 ): AgentRow {
   // Status precedence: a process exit is AUTHORITATIVE (a dead process is never
   // "working"); otherwise the event-sourced status wins; the PTY-byte heuristic is
@@ -680,6 +730,10 @@ function rowFor(
   ) {
     status = 'working';
   }
+  // Coordinator-task attribution (task 10.1): the pane's current Task among those
+  // assigned to it, chosen by `selectCurrentTask` (most-recent non-terminal, else
+  // most-recent). Pure derivation from the passed-in map — no store/polling here.
+  const currentTask = selectCurrentTask(tasks);
   return {
     paneId: pane.paneId,
     workspaceId,
@@ -720,7 +774,14 @@ function rowFor(
     pausedCount: pane.pausedCount ?? null,
     preview: pane.preview === true,
     previewCount: pane.previewCount ?? null,
-    everPrompted: event?.everPrompted === true
+    everPrompted: event?.everPrompted === true,
+    // Coordinator-task attribution (task 10.1): the pane's current Task, selected
+    // from every Task assigned to it (most-recent non-terminal, else most-recent).
+    // Null across all three fields when nothing is assigned — the row is then
+    // byte-for-byte its pre-task-board shape.
+    taskId: currentTask?.id ?? null,
+    taskGoal: currentTask?.goal ?? null,
+    taskState: currentTask?.state ?? null
   };
 }
 
@@ -742,6 +803,10 @@ function rowFor(
  * @param coordNeedsInput  set of coordinator paneIds that explicitly called
  *   `request_user_input` (tasks 10.11–10.12); a coordinator in this set needs you
  *   even with no pending AskUserQuestion. Default empty (no explicit signals).
+ * @param tasksByPane  the live pane_id -> Task[] map for coordinator-task attribution
+ *   (task 10.1): every Task assigned to each worker pane, grouped by `assigneePaneId`
+ *   by the Overview from the per-project `taskBoard`. Default empty (no tasks / board
+ *   not wired) — the row's task fields are then all null.
  */
 export function buildRoster(
   map: SnapshotMap,
@@ -751,7 +816,8 @@ export function buildRoster(
   activity: ActivityMap = {},
   workingWindowMs: number = WORKING_WINDOW_MS,
   eventActivity: Record<string, EventActivity> = {},
-  coordNeedsInput: ReadonlySet<string> = new Set()
+  coordNeedsInput: ReadonlySet<string> = new Set(),
+  tasksByPane: TaskMap = {}
 ): AgentRow[] {
   const rows: AgentRow[] = [];
   for (const ws of workspaces) {
@@ -771,7 +837,8 @@ export function buildRoster(
           eventActivity[pane.paneId],
           nowMs,
           workingWindowMs,
-          coordNeedsInput.has(pane.paneId)
+          coordNeedsInput.has(pane.paneId),
+          tasksByPane[pane.paneId]
         )
       );
     }

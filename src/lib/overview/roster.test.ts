@@ -14,6 +14,7 @@ import {
   moveId,
   orderRowsByLane,
   archivedPaneIds,
+  selectCurrentTask,
   LANE_ORDER,
   WORKING_WINDOW_MS,
   IDLE_GRACE_MS,
@@ -21,10 +22,12 @@ import {
   type AgentRow,
   type PaneRuntime,
   type RosterWorkspace,
-  type RuntimeMap
+  type RuntimeMap,
+  type TaskMap
 } from './roster';
 import type { Snapshot, SnapshotMap } from '../usage/snapshots.svelte';
 import type { EventActivity } from './events';
+import type { Task } from '../orchestration/tasks';
 
 // Tests for the PURE roster view-model (Stage 1 of agent-overview). The `it(...)`
 // titles are the EXACT `#### Scenario:` names from the agent-overview spec
@@ -1111,5 +1114,101 @@ describe('roster — modelId from snapshot', () => {
     const [row] = buildRoster(map, [normalWs], {}, now);
     expect(row.model).toBe('Claude Opus');
     expect(row.modelId).toBe('claude-opus-4-8');
+  });
+});
+
+// Task 10.1 — coordinator-task attribution on the roster row. Each worker pane's
+// current Task (goal + lifecycle state) is surfaced from the pane_id -> Task[] map
+// (grouped by assigneePaneId), selecting the most-recent non-terminal Task and
+// falling back to the most-recent terminal one. No dedicated board panel.
+describe('roster — coordinator-task attribution', () => {
+  const now = 1_000_000;
+  const wsX = ws('w1', 'W', [{ paneId: 'pane-x', cwd: '/x' }]);
+
+  /** Build a Task literal with sensible defaults; override any field. */
+  function task(over: Partial<Task> & { id: string }): Task {
+    return {
+      id: over.id,
+      goal: over.goal ?? `goal ${over.id}`,
+      projectId: over.projectId ?? 'A',
+      assigneePaneId: over.assigneePaneId ?? 'pane-x',
+      specialist: over.specialist ?? null,
+      state: over.state ?? 'assigned',
+      result: over.result ?? null,
+      artifacts: over.artifacts ?? [],
+      parentTaskId: over.parentTaskId ?? null,
+      createdAt: over.createdAt ?? 0,
+      updatedAt: over.updatedAt ?? 0,
+      notes: over.notes ?? [],
+      question: over.question ?? null,
+      blockedReason: over.blockedReason ?? null
+    };
+  }
+
+  /** buildRoster with the task map threaded into the 9th positional slot. */
+  function rosterWithTasks(tasksByPane: TaskMap): AgentRow[] {
+    return buildRoster({}, [wsX], {}, now, {}, WORKING_WINDOW_MS, {}, new Set(), tasksByPane);
+  }
+
+  it('A pane with an assigned non-terminal Task gets the task attribution fields', () => {
+    const t = task({ id: 'T1', goal: 'Refactor the parser', state: 'working', updatedAt: 5 });
+    const [row] = rosterWithTasks({ 'pane-x': [t] });
+    expect(row.taskId).toBe('T1');
+    expect(row.taskGoal).toBe('Refactor the parser');
+    expect(row.taskState).toBe('working');
+  });
+
+  it('Among several Tasks it prefers the most-recent NON-TERMINAL one', () => {
+    // A finished task is newer (updatedAt 20) than the live one (updatedAt 10), but the
+    // live non-terminal task wins — that is what the worker is currently doing.
+    const done = task({ id: 'T1', goal: 'old done', state: 'done', updatedAt: 20 });
+    const live = task({ id: 'T2', goal: 'in progress', state: 'blocked', updatedAt: 10 });
+    const [row] = rosterWithTasks({ 'pane-x': [done, live] });
+    expect(row.taskId).toBe('T2');
+    expect(row.taskState).toBe('blocked');
+    // Among two non-terminal tasks, the most-recently-updated wins.
+    const older = task({ id: 'T3', goal: 'older', state: 'assigned', updatedAt: 1 });
+    const newer = task({ id: 'T4', goal: 'newer', state: 'working', updatedAt: 9 });
+    const [row2] = rosterWithTasks({ 'pane-x': [older, newer] });
+    expect(row2.taskId).toBe('T4');
+  });
+
+  it('A pane with only terminal Tasks falls back to the most-recent terminal one', () => {
+    const failed = task({ id: 'T1', goal: 'crashed', state: 'failed', updatedAt: 3 });
+    const done = task({ id: 'T2', goal: 'shipped', state: 'done', updatedAt: 7 });
+    const [row] = rosterWithTasks({ 'pane-x': [failed, done] });
+    expect(row.taskId).toBe('T2');
+    expect(row.taskGoal).toBe('shipped');
+    expect(row.taskState).toBe('done');
+  });
+
+  it('A pane with no assigned Task carries null task fields (row unchanged)', () => {
+    // No entry in the map at all.
+    const [none] = rosterWithTasks({});
+    expect(none.taskId).toBeNull();
+    expect(none.taskGoal).toBeNull();
+    expect(none.taskState).toBeNull();
+    // An explicit empty list behaves the same.
+    const [empty] = rosterWithTasks({ 'pane-x': [] });
+    expect(empty.taskId).toBeNull();
+    expect(empty.taskGoal).toBeNull();
+    expect(empty.taskState).toBeNull();
+    // Tasks assigned to a DIFFERENT pane never leak onto this row.
+    const other = task({ id: 'T9', assigneePaneId: 'pane-other', state: 'working' });
+    const [isolated] = rosterWithTasks({ 'pane-other': [other] });
+    expect(isolated.taskId).toBeNull();
+  });
+
+  it('selectCurrentTask pure helper: null for empty, recency + non-terminal preference', () => {
+    expect(selectCurrentTask(undefined)).toBeNull();
+    expect(selectCurrentTask([])).toBeNull();
+    // Non-terminal preferred over a newer terminal.
+    const done = task({ id: 'T1', state: 'done', updatedAt: 100 });
+    const live = task({ id: 'T2', state: 'working', updatedAt: 5 });
+    expect(selectCurrentTask([done, live])?.id).toBe('T2');
+    // Recency tie on updatedAt broken by createdAt, then id.
+    const a = task({ id: 'T3', state: 'assigned', updatedAt: 5, createdAt: 1 });
+    const b = task({ id: 'T4', state: 'assigned', updatedAt: 5, createdAt: 2 });
+    expect(selectCurrentTask([a, b])?.id).toBe('T4');
   });
 });
