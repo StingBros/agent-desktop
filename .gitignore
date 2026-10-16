@@ -18,3 +18,4 @@ worktrees
 
 # Tauri / Rust
 src-tauri/target/
+.worktrees
